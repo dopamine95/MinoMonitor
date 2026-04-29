@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Mino Monitor launcher.
+# Usage:
+#   minomon              live mode (default)
+#   minomon --stub       fake-data preview (no system access)
+#   minomon --top-n 50   show 50 processes
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec python3 -m minomon "$@"
