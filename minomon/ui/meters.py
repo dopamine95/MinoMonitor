@@ -48,23 +48,26 @@ class MetersPanel(Static):
         if s is None:
             return Panel("Loading…", border_style=theme.PALETTE["border"])
 
-        # Memory breakdown — the centerpiece
+        # Memory breakdown — the centerpiece.
+        # Pressure SEVERITY follows the kernel's pressure_level signal (NORMAL /
+        # WARN / CRITICAL), NOT the percentage. macOS routinely runs at >80%
+        # committed without pressure (lots of cached files, compressor idle),
+        # and using the % to drive color produced the contradictory
+        # "!! NORMAL (84%)" display.
         mem = s.memory
-        ram_sev = mem.pressure_level.lower() if mem.pressure_level != "NORMAL" else "ok"
-        if ram_sev == "warn":
-            sev_key = "warn"
-        elif ram_sev == "critical":
-            sev_key = "critical"
-        else:
-            sev_key = theme.severity_for_pct(mem.pressure_pct)
+        sev_key = {
+            "NORMAL":   "ok",
+            "WARN":     "warn",
+            "CRITICAL": "critical",
+        }.get(mem.pressure_level, "info")
 
         # Top headline row
         pressure_color = theme.severity_color(sev_key)
         pressure_icon = {
-            "ok": theme.GLYPHS.icon_ok,
-            "warn": theme.GLYPHS.icon_warn,
+            "ok":       theme.GLYPHS.icon_ok,
+            "warn":     theme.GLYPHS.icon_warn,
             "critical": theme.GLYPHS.icon_critical,
-            "info": theme.GLYPHS.icon_info,
+            "info":     theme.GLYPHS.icon_info,
         }[sev_key]
 
         spark_ram = theme.make_sparkline(list(self._ram_history), max_value=100)
@@ -95,34 +98,52 @@ class MetersPanel(Static):
                 f"[{theme.PALETTE['dim']}]{note}[/]" if note else "",
             )
 
-        # Labels swap in vibe mode to plain English
+        # The breakdown is rendered against TOTAL = Used + Available, where
+        # Used = App + Wired + Compressed (Activity Monitor's "Memory Used"
+        # footer) and Available = Cached + Free. Cached files are shown
+        # under Available because macOS reclaims them on demand without any
+        # cost. This keeps the bar segments visually adding to ≤100% and
+        # matches Apple's mental model.
         if self.vibe_mode:
-            row("Apps",       mem.app_gb,        mem.total_gb, theme.SEVERITY["info"],
-                "what your apps need")
-            row("Squeezed",   mem.compressed_gb, mem.total_gb, theme.SEVERITY["warn"],
+            row("Apps",     mem.app_gb,        mem.total_gb, theme.SEVERITY["info"],
+                "what your apps actually need")
+            row("Squeezed", mem.compressed_gb, mem.total_gb, theme.SEVERITY["warn"],
                 "macOS shrunk these to fit")
-            row("Locked",     mem.wired_gb,      mem.total_gb, theme.PALETTE["pinned"],
-                "OS — can't be moved")
-            row("Cached",     mem.cached_gb,     mem.total_gb, theme.PALETTE["muted"],
-                "files macOS keeps handy")
-            row("Free",       mem.free_gb,       mem.total_gb, theme.SEVERITY["ok"],
-                "tight, but ok" if mem.free_gb < 1.0 else "open and ready")
+            row("Locked",   mem.wired_gb,      mem.total_gb, theme.PALETTE["pinned"],
+                "OS internals — can't be moved")
+            row("Cached",   mem.cached_gb,     mem.total_gb, theme.PALETTE["muted"],
+                "free if needed — open files & disk cache")
+            row("Free",     mem.free_gb,       mem.total_gb, theme.SEVERITY["ok"],
+                "untouched, ready")
         else:
-            row("App",   mem.app_gb,        mem.total_gb, theme.SEVERITY["info"])
-            row("Comp",  mem.compressed_gb, mem.total_gb, theme.SEVERITY["warn"], "← OS compressing")
-            row("Wired", mem.wired_gb,      mem.total_gb, theme.PALETTE["pinned"])
-            row("Cache", mem.cached_gb,     mem.total_gb, theme.PALETTE["muted"])
-            row("Free",  mem.free_gb,       mem.total_gb, theme.SEVERITY["ok"],
-                "← tight" if mem.free_gb < 1.0 else "")
+            row("App",   mem.app_gb,        mem.total_gb, theme.SEVERITY["info"],   "in use by apps")
+            row("Comp",  mem.compressed_gb, mem.total_gb, theme.SEVERITY["warn"],   "kernel-compressed")
+            row("Wired", mem.wired_gb,      mem.total_gb, theme.PALETTE["pinned"],  "kernel-locked")
+            row("Cache", mem.cached_gb,     mem.total_gb, theme.PALETTE["muted"],   "reclaimable")
+            row("Free",  mem.free_gb,       mem.total_gb, theme.SEVERITY["ok"],     "untouched")
 
-        # Headline above the breakdown
+        # Headline above the breakdown.
+        # Two separate signals, never contradictory:
+        #   - Pressure: kernel-reported state (the green/yellow/red bar in AM)
+        #   - Used: how much of total RAM is currently committed to apps
+        used_gb = mem.app_gb + mem.wired_gb + mem.compressed_gb
+        used_pct = (used_gb / mem.total_gb) * 100 if mem.total_gb else 0
         headline = Text()
-        headline.append("RAM PRESSURE  ", style=f"bold {theme.PALETTE['fg_strong']}")
-        headline.append(f"{pressure_icon} {mem.pressure_level}", style=f"bold {pressure_color}")
-        headline.append(f"   ({mem.pressure_pct}%)", style=theme.PALETTE["muted"])
+        if self.vibe_mode:
+            headline.append("Memory pressure  ", style=f"bold {theme.PALETTE['fg_strong']}")
+        else:
+            headline.append("PRESSURE  ", style=f"bold {theme.PALETTE['fg_strong']}")
+        headline.append(f"{pressure_icon} {mem.pressure_level.title()}", style=f"bold {pressure_color}")
+        headline.append("    ", style=theme.PALETTE["muted"])
+        used_label = "in use" if self.vibe_mode else "USED"
+        headline.append(f"{used_label}  ", style=f"bold {theme.PALETTE['fg_strong']}")
+        headline.append(
+            f"{used_gb:.1f} / {mem.total_gb:.0f} GB ({used_pct:.0f}%)",
+            style=theme.PALETTE["fg"],
+        )
         if mem.swap_in_rate_mbps > 0.5 or mem.swap_out_rate_mbps > 0.5:
             headline.append(
-                f"   swap: in {mem.swap_in_rate_mbps:.1f} MB/s  out {mem.swap_out_rate_mbps:.1f} MB/s",
+                f"    swap  in {mem.swap_in_rate_mbps:.1f}  out {mem.swap_out_rate_mbps:.1f} MB/s",
                 style=theme.SEVERITY["warn"],
             )
 

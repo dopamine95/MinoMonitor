@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import plistlib
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -143,16 +144,27 @@ class Sampler:
 
         swap_in_rate = 0.0
         swap_out_rate = 0.0
+        compress_rate_mbps = 0.0
         if self._previous_vm_stats is not None and self._previous_vm_time is not None:
             dt = max(0.001, timestamp - self._previous_vm_time)
             swap_in_delta = max(0, stats.get("swapins", 0) - self._previous_vm_stats.get("swapins", 0))
             swap_out_delta = max(0, stats.get("swapouts", 0) - self._previous_vm_stats.get("swapouts", 0))
             swap_in_rate = swap_in_delta / (1024 ** 2) / dt
             swap_out_rate = swap_out_delta / (1024 ** 2) / dt
+            # Rate at which the kernel is actively COMPRESSING memory right now.
+            # `comprs` is the lifetime page-compression counter (see vm_stat).
+            comprs_delta = max(0, stats.get("comprs", 0) - self._previous_vm_stats.get("comprs", 0))
+            compress_rate_mbps = (comprs_delta * _PAGE_SIZE) / (1024 ** 2) / dt
 
         self._previous_vm_stats = stats
         self._previous_vm_time = timestamp
-        pressure_level = memory_pressure()
+
+        # Derive Activity-Monitor-style pressure level from real activity,
+        # NOT from memory_pressure(1)'s "free percentage" (which is unrelated to
+        # AM's pressure graph). Apple's algorithm hinges on whether the system
+        # is actively reclaiming via compression and swap.
+        pressure_level = _derive_pressure_level(compress_rate_mbps, swap_out_rate)
+
         used_pages = app_pages + wired_pages + compressed_pages
         pressure_pct = max(0, min(100, round((used_pages / total_pages) * 100))) if total_pages else 0
         return MemorySample(
@@ -265,8 +277,8 @@ class Sampler:
         if cached and cached.start_unix == start_unix:
             return cached
 
-        name = process.name()
         bundle_id = _bundle_id_for_process(process)
+        name = _human_name(process, bundle_id)
         meta = _ProcessMeta(name=name, bundle_id=bundle_id, start_unix=start_unix)
         self._process_meta[process.pid] = meta
         return meta
@@ -369,6 +381,27 @@ def _pages_to_gb(pages: int) -> float:
     return pages * _PAGE_SIZE / (1024 ** 3)
 
 
+def _derive_pressure_level(compress_rate_mbps: float, swap_out_rate_mbps: float) -> str:
+    """Activity-Monitor-style pressure level, derived from real activity.
+
+    Apple's pressure indicator is driven by whether the kernel is actively
+    reclaiming memory — compressing pages and swapping out — not by a static
+    used/total ratio. macOS routinely sits at 80%+ committed without any
+    pressure because compression and file-cache eviction handle bursts
+    cheaply. Pressure only registers when those mechanisms are saturating.
+
+    Heuristic thresholds (calibrated for an idle vs working M1 Max):
+      - CRITICAL  swap is moving > 5 MB/s out (system is paging to disk)
+      - WARN      compressor running > 50 MB/s OR any sustained swap
+      - NORMAL    otherwise — compressor and swap are quiet, system is calm
+    """
+    if swap_out_rate_mbps > 5.0:
+        return "CRITICAL"
+    if swap_out_rate_mbps > 0.5 or compress_rate_mbps > 50.0:
+        return "WARN"
+    return "NORMAL"
+
+
 def _split_cores(per_core: list[float]) -> tuple[list[float], list[float]]:
     count = len(per_core)
     if count <= 4:
@@ -413,6 +446,116 @@ def _format_idle(seconds_idle: int) -> str:
         return f"idle {hours}h"
     minutes = max(1, round(seconds_idle / 60))
     return f"idle {minutes}m"
+
+
+def _bundle_display_name(process: psutil.Process) -> Optional[str]:
+    """Read CFBundleDisplayName / CFBundleName from a .app bundle's Info.plist.
+    This is what Activity Monitor and the Dock show — much friendlier than
+    psutil.name() which returns 'Python', 'Helper (Renderer)', or version strings."""
+    try:
+        exe_path = Path(process.exe()).resolve()
+    except (psutil.Error, OSError):
+        return None
+    bundle_root: Optional[Path] = None
+    for parent in (exe_path,) + tuple(exe_path.parents):
+        if parent.suffix == ".app":
+            bundle_root = parent
+            break
+    if not bundle_root:
+        return None
+    info_plist = bundle_root / "Contents" / "Info.plist"
+    try:
+        with info_plist.open("rb") as handle:
+            payload = plistlib.load(handle)
+    except Exception:
+        return None
+    for key in ("CFBundleDisplayName", "CFBundleName"):
+        v = payload.get(key)
+        if v:
+            return str(v)
+    # Fall back to the .app dir's stem
+    return bundle_root.stem
+
+
+# Bundle ids whose CFBundleName is generic (the language name) and whose
+# real identity comes from the script in argv. Bypass the bundle lookup for
+# these and always derive the name from the cmdline.
+_INTERPRETER_BUNDLE_PREFIXES = (
+    "org.python.",
+    "org.nodejs.",
+    "ruby-lang.org.",
+    "com.oracle.java.",
+)
+
+
+def _script_from_cmdline(process: psutil.Process) -> Optional[str]:
+    """Pick the most informative argv entry for an interpreter process —
+    the first non-flag argument that looks like a script path."""
+    try:
+        cmd = process.cmdline() or []
+    except (psutil.Error, OSError):
+        return None
+    for arg in cmd[1:]:
+        if arg.startswith("-"):
+            continue
+        base = os.path.basename(arg)
+        if base and ("." in base or "/" in arg):
+            return base
+    return None
+
+
+def _human_name(process: psutil.Process, bundle_id: Optional[str]) -> str:
+    """Best-effort human-readable process name.
+
+    Resolution order:
+      1. If process is a generic interpreter (Python, Node, etc.), prefer the
+         script name from its cmdline. Otherwise an mlx-lm chat server just
+         reads as 'Python'.
+      2. App bundle's CFBundleDisplayName / CFBundleName (Activity Monitor's value)
+      3. psutil.Process.name() — final fallback
+    """
+    is_interpreter = bool(bundle_id) and any(
+        bundle_id.startswith(p) for p in _INTERPRETER_BUNDLE_PREFIXES
+    )
+    try:
+        raw_name = process.name() or ""
+    except (psutil.Error, OSError):
+        raw_name = ""
+
+    if is_interpreter or raw_name.lower().startswith(("python", "node", "ruby", "perl", "java")):
+        script = _script_from_cmdline(process)
+        if script:
+            interp = raw_name or (bundle_id.split(".")[-1] if bundle_id else "interpreter")
+            return f"{interp} · {script}"
+
+    bundle_name = _bundle_display_name(process)
+    if bundle_name and not _looks_like_version_string(bundle_name):
+        return bundle_name
+
+    # If raw_name is a version string (some CLIs install per-version dirs and
+    # the executable filename is the version), use cmdline[0] basename instead.
+    if raw_name and _looks_like_version_string(raw_name):
+        try:
+            cmd = process.cmdline() or []
+        except (psutil.Error, OSError):
+            cmd = []
+        if cmd:
+            base = os.path.basename(cmd[0])
+            if base and not _looks_like_version_string(base):
+                return base
+        return bundle_id or raw_name or f"pid {process.pid}"
+
+    return raw_name or (bundle_id or f"pid {process.pid}")
+
+
+_VERSION_RE = re.compile(r"^\d+(\.\d+){1,3}([a-z0-9.-]*)?$")
+
+
+def _looks_like_version_string(name: str) -> bool:
+    """Some bundles' CFBundleName is literally the version (e.g. Slack's
+    helpers come back as '2.1.116'). When that happens, fall through to a
+    different field rather than show the version to the user."""
+    return bool(_VERSION_RE.match(name.strip()))
 
 
 def _bundle_id_for_process(process: psutil.Process) -> Optional[str]:
