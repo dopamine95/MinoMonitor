@@ -192,6 +192,11 @@ class MetersPanel(Static):
                 ),
             )
 
+        # Optional integration: a local app can publish a small JSON file
+        # advertising its loaded models / activity. When the file is present
+        # we render a one-line summary. When absent, the row is omitted
+        # entirely — keeps the dashboard compact for users who don't use it.
+        # See docs/integrations.md for the schema.
         cassie = s.cassie
         if cassie.available:
             stat_chunks = []
@@ -217,14 +222,6 @@ class MetersPanel(Static):
                 + f"   {activity}"
             )
             right.add_row("", cassie_line)
-        else:
-            right.add_row(
-                "",
-                Text.from_markup(
-                    f"{theme.GLYPHS.icon_brain} "
-                    f"[{theme.PALETTE['muted']}]Cassie status not reporting[/]"
-                ),
-            )
 
         body.add_row(left, right)
         return Panel(

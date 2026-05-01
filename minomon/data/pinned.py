@@ -10,6 +10,10 @@ import psutil
 from .macos import lsappinfo_front
 
 
+# System processes that are dangerous to suspend or quit. Pinned in the UI
+# (action buttons greyed out). This list is intentionally conservative —
+# anything in flight that the kernel watchdogs care about, anything that
+# parents can restart on a timeout, anything that owns shared infrastructure.
 PINNED_NAMES = {
     "kernel_task",
     "WindowServer",
@@ -18,11 +22,13 @@ PINNED_NAMES = {
     "SystemUIServer",
     "launchd",
     "loginwindow",
+    # Spotlight + metadata
     "mds",
     "mds_stores",
     "mdworker",
     "mdworker_shared",
     "fseventsd",
+    # Daemons that other things assume are alive
     "distnoted",
     "cfprefsd",
     "runningboardd",
@@ -40,8 +46,7 @@ PINNED_NAMES = {
     "coreaudiod",
     "bluetoothd",
     "controlcenter",
-    "Cassie",
-    "cassie_server.py",
+    # Common dev tooling. Remove if you want these manageable.
     "Xcode",
 }
 
@@ -50,12 +55,14 @@ PINNED_BUNDLE_IDS = {
     "com.apple.dock",
     "com.apple.systemuiserver",
     "com.apple.dt.Xcode",
+    # Common terminals — auto-detection in add_terminal_app() also handles
+    # whichever terminal the user actually launched the monitor from.
     "com.apple.Terminal",
     "com.googlecode.iterm2",
     "net.kovidgoyal.kitty",
     "io.alacritty",
     "co.zeit.hyper",
-    "com.threetrees.cassie",
+    "com.mitchellh.ghostty",
 }
 
 AUDIO_BUNDLE_IDS = {
@@ -106,7 +113,7 @@ def is_pinned(name: str, bundle_id: Optional[str]) -> bool:
     if normalized_name and normalized_name in _TERMINAL_NAMES:
         return True
     lowered = normalized_name.lower()
-    return "cassie" in lowered or lowered.endswith("terminal")
+    return lowered.endswith("terminal")
 
 
 def _parent_chain_bundle_ids() -> set[str]:

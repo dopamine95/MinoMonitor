@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.python-version
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Tooling
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Mino Monitor runtime state — these live under ~/.minomonitor/, but in
+# case anyone runs the monitor from inside the repo with a custom state
+# dir, ignore the local equivalents too.
+.minomonitor/
+state.json
+actions.log

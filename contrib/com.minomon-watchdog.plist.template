@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Mino Monitor — launchd watchdog template.
+
+    Replace __MINOMON_INSTALL_PATH__ with the absolute path of your clone
+    before installing. Easiest:
+
+        sed "s|__MINOMON_INSTALL_PATH__|$(pwd)|g" \
+            contrib/com.minomon-watchdog.plist.template \
+            > ~/Library/LaunchAgents/com.minomon-watchdog.plist
+        launchctl load ~/Library/LaunchAgents/com.minomon-watchdog.plist
+
+    To uninstall:
+        launchctl unload ~/Library/LaunchAgents/com.minomon-watchdog.plist
+        rm ~/Library/LaunchAgents/com.minomon-watchdog.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.minomon-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__MINOMON_INSTALL_PATH__/minomon/actions/watchdog.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

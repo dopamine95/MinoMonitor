@@ -86,7 +86,7 @@ def build_insights(
     insights.append(
         Insight(
             severity="ok",
-            message="Deny-list protections are active for system apps, terminals, Xcode, and Cassie.",
+            message="Deny-list protections active for system apps and your terminal.",
         )
     )
     return insights
