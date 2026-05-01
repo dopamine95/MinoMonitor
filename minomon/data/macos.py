@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import subprocess
@@ -8,9 +9,72 @@ from typing import Optional
 
 
 _VM_STAT_CACHE: tuple[float, dict[str, int]] | None = None
-_MEMORY_PRESSURE_CACHE: tuple[float, tuple[str, int]] | None = None
+_MEMORY_PRESSURE_CACHE: tuple[float, str] | None = None
 _FRONT_APP_CACHE: tuple[float, Optional[str]] | None = None
 _RUNNING_APPS_CACHE: tuple[float, set[str]] | None = None
+_PERF_LEVEL_CACHE: tuple[float, tuple[int, int] | None] | None = None
+
+_LIBSYSTEM = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+_KERN_SUCCESS = 0
+_MACH_PORT_NULL = 0
+_TASK_VM_INFO = 22
+
+
+class _TimeValue(ctypes.Structure):
+    _fields_ = [
+        ("seconds", ctypes.c_int),
+        ("microseconds", ctypes.c_int),
+    ]
+
+
+class _TaskVmInfo(ctypes.Structure):
+    _fields_ = [
+        ("virtual_size", ctypes.c_uint64),
+        ("region_count", ctypes.c_int),
+        ("page_size", ctypes.c_int),
+        ("resident_size", ctypes.c_uint64),
+        ("resident_size_peak", ctypes.c_uint64),
+        ("device", ctypes.c_uint64),
+        ("device_peak", ctypes.c_uint64),
+        ("internal", ctypes.c_uint64),
+        ("internal_peak", ctypes.c_uint64),
+        ("external", ctypes.c_uint64),
+        ("external_peak", ctypes.c_uint64),
+        ("reusable", ctypes.c_uint64),
+        ("reusable_peak", ctypes.c_uint64),
+        ("purgeable_volatile_pmap", ctypes.c_uint64),
+        ("purgeable_volatile_resident", ctypes.c_uint64),
+        ("purgeable_volatile_virtual", ctypes.c_uint64),
+        ("compressed", ctypes.c_uint64),
+        ("compressed_peak", ctypes.c_uint64),
+        ("compressed_lifetime", ctypes.c_uint64),
+        ("phys_footprint", ctypes.c_uint64),
+        ("min_address", ctypes.c_uint64),
+        ("max_address", ctypes.c_uint64),
+    ]
+
+
+_TASK_VM_INFO_COUNT = ctypes.sizeof(_TaskVmInfo) // ctypes.sizeof(ctypes.c_int)
+
+_LIBSYSTEM.task_for_pid.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint)]
+_LIBSYSTEM.task_for_pid.restype = ctypes.c_int
+_LIBSYSTEM.task_info.argtypes = [
+    ctypes.c_uint,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_uint),
+]
+_LIBSYSTEM.task_info.restype = ctypes.c_int
+_LIBSYSTEM.mach_port_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint]
+_LIBSYSTEM.mach_port_deallocate.restype = ctypes.c_int
+_LIBSYSTEM.sysctlbyname.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+]
+_LIBSYSTEM.sysctlbyname.restype = ctypes.c_int
 
 
 def vm_stat() -> dict[str, int]:
@@ -35,7 +99,7 @@ def vm_stat() -> dict[str, int]:
     return dict(parsed)
 
 
-def memory_pressure() -> tuple[str, int]:
+def memory_pressure() -> str:
     global _MEMORY_PRESSURE_CACHE
 
     now = time.monotonic()
@@ -53,8 +117,48 @@ def memory_pressure() -> tuple[str, int]:
     else:
         level = "NORMAL"
 
-    result = (level, pressure_pct)
+    result = level
     _MEMORY_PRESSURE_CACHE = (now, result)
+    return result
+
+
+def process_phys_footprint(pid: int) -> int | None:
+    task = ctypes.c_uint(_MACH_PORT_NULL)
+    task_self = ctypes.c_uint.in_dll(_LIBSYSTEM, "mach_task_self_").value
+    kr = _LIBSYSTEM.task_for_pid(task_self, pid, ctypes.byref(task))
+    if kr != _KERN_SUCCESS or task.value == _MACH_PORT_NULL:
+        return None
+
+    try:
+        info = _TaskVmInfo()
+        count = ctypes.c_uint(_TASK_VM_INFO_COUNT)
+        kr = _LIBSYSTEM.task_info(
+            task,
+            _TASK_VM_INFO,
+            ctypes.byref(info),
+            ctypes.byref(count),
+        )
+        if kr != _KERN_SUCCESS:
+            return None
+        return int(info.phys_footprint)
+    finally:
+        _LIBSYSTEM.mach_port_deallocate(task_self, task)
+
+
+def perf_levels() -> tuple[int, int] | None:
+    global _PERF_LEVEL_CACHE
+
+    now = time.monotonic()
+    if _PERF_LEVEL_CACHE and now - _PERF_LEVEL_CACHE[0] < 60.0:
+        return _PERF_LEVEL_CACHE[1]
+
+    perf = _sysctl_uint("hw.perflevel0.physicalcpu")
+    eff = _sysctl_uint("hw.perflevel1.physicalcpu")
+    result = None
+    if perf is not None and eff is not None and perf >= 0 and eff >= 0:
+        result = (perf, eff)
+
+    _PERF_LEVEL_CACHE = (now, result)
     return result
 
 
@@ -171,9 +275,24 @@ def _parse_int_token(token: str) -> int:
     value = int(match.group(1))
     suffix = match.group(2)
     if suffix == "K":
-        return value * 1_000
+        return value * 1024
     if suffix == "M":
-        return value * 1_000_000
+        return value * 1024 * 1024
     if suffix == "B":
-        return value * 1_000_000_000
+        return value * 1024 * 1024 * 1024
     return value
+
+
+def _sysctl_uint(name: str) -> int | None:
+    value = ctypes.c_uint()
+    size = ctypes.c_size_t(ctypes.sizeof(value))
+    result = _LIBSYSTEM.sysctlbyname(
+        name.encode("utf-8"),
+        ctypes.byref(value),
+        ctypes.byref(size),
+        None,
+        0,
+    )
+    if result != 0:
+        return None
+    return int(value.value)

@@ -21,11 +21,13 @@ _ACTION_DESCRIPTION = {
                "Lowers QoS to background. Safe and reversible. No socket damage."),
     "uncalm": ("Restore QoS",
                "Returns the process to default scheduling priority."),
-    "freeze": ("Freeze (SIGSTOP)",
-               "Pauses the process entirely. Auto-resumes in 60 seconds. "
-               "May break audio sessions or live WebSockets — see warnings below."),
-    "thaw":   ("Thaw (SIGCONT)",
-               "Resumes a frozen process."),
+    "freeze": ("Pause this app",
+               "Pauses the app completely without quitting it. "
+               "Memory stays where it is, but CPU work stops, which calms the system. "
+               "Auto-resumes in 60 seconds. Safe for most apps; "
+               "may briefly disconnect audio or live chat sessions on resume."),
+    "thaw":   ("Resume this app",
+               "Wakes a paused app right back up where it left off."),
     "quit":   ("Quit application",
                "Sends a graceful quit (osascript). Falls back to SIGTERM if it doesn't respond."),
 }

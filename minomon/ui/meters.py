@@ -23,6 +23,7 @@ class MetersPanel(Static):
     """Top header section. Updates by being handed each new Sample."""
 
     sample: reactive[Sample | None] = reactive(None)
+    vibe_mode: reactive[bool] = reactive(False)
 
     def __init__(self, history_seconds: int = 60, **kwargs):
         super().__init__(**kwargs)
@@ -30,6 +31,10 @@ class MetersPanel(Static):
         self._ram_history: Deque[float] = deque(maxlen=history_seconds)
         self._cpu_history: Deque[float] = deque(maxlen=history_seconds)
         self._gpu_history: Deque[float] = deque(maxlen=history_seconds)
+
+    def watch_vibe_mode(self, _old: bool, _new: bool) -> None:
+        # Force a re-render when mode flips
+        self.refresh()
 
     def push(self, sample: Sample) -> None:
         """Sampler hands us each tick."""
@@ -90,12 +95,25 @@ class MetersPanel(Static):
                 f"[{theme.PALETTE['dim']}]{note}[/]" if note else "",
             )
 
-        row("App",      mem.app_gb,        mem.total_gb, theme.SEVERITY["info"])
-        row("Comp",     mem.compressed_gb, mem.total_gb, theme.SEVERITY["warn"], "← OS compressing")
-        row("Wired",    mem.wired_gb,      mem.total_gb, theme.PALETTE["pinned"])
-        row("Cache",    mem.cached_gb,     mem.total_gb, theme.PALETTE["muted"])
-        row("Free",     mem.free_gb,       mem.total_gb, theme.SEVERITY["ok"],
-            "← tight" if mem.free_gb < 1.0 else "")
+        # Labels swap in vibe mode to plain English
+        if self.vibe_mode:
+            row("Apps",       mem.app_gb,        mem.total_gb, theme.SEVERITY["info"],
+                "what your apps need")
+            row("Squeezed",   mem.compressed_gb, mem.total_gb, theme.SEVERITY["warn"],
+                "macOS shrunk these to fit")
+            row("Locked",     mem.wired_gb,      mem.total_gb, theme.PALETTE["pinned"],
+                "OS — can't be moved")
+            row("Cached",     mem.cached_gb,     mem.total_gb, theme.PALETTE["muted"],
+                "files macOS keeps handy")
+            row("Free",       mem.free_gb,       mem.total_gb, theme.SEVERITY["ok"],
+                "tight, but ok" if mem.free_gb < 1.0 else "open and ready")
+        else:
+            row("App",   mem.app_gb,        mem.total_gb, theme.SEVERITY["info"])
+            row("Comp",  mem.compressed_gb, mem.total_gb, theme.SEVERITY["warn"], "← OS compressing")
+            row("Wired", mem.wired_gb,      mem.total_gb, theme.PALETTE["pinned"])
+            row("Cache", mem.cached_gb,     mem.total_gb, theme.PALETTE["muted"])
+            row("Free",  mem.free_gb,       mem.total_gb, theme.SEVERITY["ok"],
+                "← tight" if mem.free_gb < 1.0 else "")
 
         # Headline above the breakdown
         headline = Text()

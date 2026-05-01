@@ -15,15 +15,15 @@ from typing import Optional
 class MemorySample:
     """Apple-Silicon-honest memory accounting (gigabytes unless noted)."""
     total_gb: float
-    app_gb: float           # active + inactive app memory (resident, uncompressed)
+    app_gb: float           # Activity Monitor "App Memory"
     wired_gb: float         # kernel-locked, never compressible
-    compressed_gb: float    # bytes the compressor has shrunk
-    cached_gb: float        # file-backed cache (purgeable under pressure)
+    compressed_gb: float    # Activity Monitor "Compressed Memory"
+    cached_gb: float        # Activity Monitor "Cached Files"
     free_gb: float
     swap_in_rate_mbps: float
     swap_out_rate_mbps: float
     pressure_level: str     # "NORMAL" | "WARN" | "CRITICAL"
-    pressure_pct: int       # 0-100, kernel-derived utilization estimate
+    pressure_pct: int       # 0-100, (app + wired + compressed) / total
 
 
 @dataclass
@@ -51,7 +51,7 @@ class ProcessRow:
     pid: int
     start_unix: int           # used as identity guard; PID alone is reused
     name: str                 # human-friendly app/proc name
-    rss_gb: float
+    rss_gb: float             # Activity Monitor "Memory" / phys_footprint
     cpu_pct: float
     state: str                # "active" | "foreground" | "idle Xm" | "playing" | "paused" | "calmed"
     pinned: bool              # in deny list — UI greys out actions

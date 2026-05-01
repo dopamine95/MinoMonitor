@@ -78,15 +78,17 @@ class MinoMonitorApp(App):
         Binding("?", "help", "Help"),
         Binding("q", "quit_app", "Quit"),
         Binding("r", "force_refresh", "Refresh"),
+        Binding("v", "toggle_vibe", "Vibe view"),
     ]
 
     TITLE = "Mino Monitor"
-    SUB_TITLE = "live system telemetry"
 
-    def __init__(self, sampler):
+    def __init__(self, sampler, vibe_mode: bool = False):
         super().__init__()
         self.sampler = sampler
         self._action_lock = asyncio.Lock()
+        self._vibe_mode = vibe_mode
+        self.sub_title = "vibe view" if vibe_mode else "live system telemetry"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -99,9 +101,30 @@ class MinoMonitorApp(App):
 
     async def on_mount(self) -> None:
         _write_pid_file()
+        # Apply initial vibe mode to all panels that support it
+        self._apply_vibe_mode(self._vibe_mode)
         # Wire sampler updates → UI panels.
         self.sampler.subscribe(self._on_sample)
         await self.sampler.start()
+
+    def _apply_vibe_mode(self, on: bool) -> None:
+        try:
+            self.query_one("#processes", ProcessesPanel).vibe_mode = on
+            self.query_one("#meters", MetersPanel).vibe_mode = on
+            self.query_one("#insights", InsightsPanel).vibe_mode = on
+        except Exception:
+            pass
+
+    def action_toggle_vibe(self) -> None:
+        self._vibe_mode = not self._vibe_mode
+        self.sub_title = "vibe view" if self._vibe_mode else "live system telemetry"
+        self._apply_vibe_mode(self._vibe_mode)
+        self.notify(
+            "Vibe view: ON — plain English mode."
+            if self._vibe_mode else
+            "Techie view: ON — full detail.",
+            timeout=3,
+        )
 
     async def on_unmount(self) -> None:
         try:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+"""Per-process memory matches Activity Monitor's 'Memory' column.
+System-wide accounting matches Activity Monitor's Memory tab footer."""
+
 import asyncio
 import json
 import os
@@ -15,7 +18,7 @@ import psutil
 from minomon.actions._common import MONITOR_PID_FILE, ensure_state_dirs, list_calmed_sentinels, list_paused_sentinels, prune_invalid_calmed_sentinels
 from minomon.actions.freeze import resume_orphaned_paused_processes
 from .insights import build_insights
-from .macos import lsappinfo_front, memory_pressure, running_apps, vm_stat
+from .macos import lsappinfo_front, memory_pressure, perf_levels, process_phys_footprint, running_apps, vm_stat
 from .pinned import AUDIO_BUNDLE_IDS, SOCKET_HEAVY_BUNDLE_IDS, add_terminal_app, is_pinned
 from .sample import CassieStatus, CPUSample, GPUSample, MemorySample, ProcessRow, Sample
 
@@ -111,12 +114,22 @@ class Sampler:
 
     def _sample_memory(self, timestamp: float) -> MemorySample:
         stats = vm_stat()
-        total_gb = psutil.virtual_memory().total / (1024 ** 3)
-        free_gb = _pages_to_gb(stats.get("free", 0))
-        wired_gb = _pages_to_gb(stats.get("wired", 0))
-        compressed_gb = _pages_to_gb(stats.get("cmprssed", 0))
-        cached_gb = _pages_to_gb(stats.get("file-backed", 0) + stats.get("prgable", 0))
-        app_gb = _pages_to_gb(stats.get("anonymous", 0))
+        total_bytes = psutil.virtual_memory().total
+        total_pages = total_bytes // _PAGE_SIZE
+
+        speculative_pages = stats.get("specul", 0)
+        free_pages = max(0, stats.get("free", 0) - speculative_pages)
+        wired_pages = stats.get("wired", 0)
+        compressed_pages = stats.get("cmprssed", 0)
+        cached_pages = stats.get("file-backed", 0) + speculative_pages + stats.get("prgable", 0)
+        app_pages = max(0, total_pages - free_pages - wired_pages - compressed_pages - cached_pages)
+
+        total_gb = total_bytes / (1024 ** 3)
+        free_gb = _pages_to_gb(free_pages)
+        wired_gb = _pages_to_gb(wired_pages)
+        compressed_gb = _pages_to_gb(compressed_pages)
+        cached_gb = _pages_to_gb(cached_pages)
+        app_gb = _pages_to_gb(app_pages)
 
         swap_in_rate = 0.0
         swap_out_rate = 0.0
@@ -129,7 +142,9 @@ class Sampler:
 
         self._previous_vm_stats = stats
         self._previous_vm_time = timestamp
-        pressure_level, pressure_pct = memory_pressure()
+        pressure_level = memory_pressure()
+        used_pages = app_pages + wired_pages + compressed_pages
+        pressure_pct = max(0, min(100, round((used_pages / total_pages) * 100))) if total_pages else 0
         return MemorySample(
             total_gb=round(total_gb, 2),
             app_gb=round(app_gb, 2),
@@ -164,16 +179,24 @@ class Sampler:
 
         rows: list[ProcessRow] = []
         processes = []
-        for process in psutil.process_iter(["pid", "name", "memory_info", "create_time"]):
-            try:
-                rss = process.info["memory_info"].rss if process.info["memory_info"] else 0
-                processes.append((rss, process))
-            except (psutil.Error, OSError):
-                continue
+        try:
+            process_iter = psutil.process_iter(["pid", "name", "create_time"])
+        except (psutil.Error, OSError, PermissionError):
+            return rows
+
+        try:
+            for process in process_iter:
+                try:
+                    footprint = _process_memory_bytes(process)
+                    processes.append((footprint, process))
+                except (psutil.Error, OSError, PermissionError):
+                    continue
+        except (psutil.Error, OSError, PermissionError):
+            return rows
         processes.sort(key=lambda item: item[0], reverse=True)
 
         current_pids = set()
-        for rss, process in processes[: self.top_n]:
+        for footprint, process in processes[: self.top_n]:
             try:
                 pid = process.pid
                 current_pids.add(pid)
@@ -209,7 +232,7 @@ class Sampler:
                         pid=pid,
                         start_unix=meta.start_unix,
                         name=meta.name,
-                        rss_gb=round(rss / (1024 ** 3), 2),
+                        rss_gb=round(footprint / (1024 ** 3), 2),
                         cpu_pct=round(cpu_pct, 1),
                         state=state,
                         pinned=pinned,
@@ -340,17 +363,38 @@ def _split_cores(per_core: list[float]) -> tuple[list[float], list[float]]:
     count = len(per_core)
     if count <= 4:
         return per_core, []
-    mapping = {
-        6: 4,
-        8: 4,
-        10: 8,
-        12: 8,
-        14: 10,
-        16: 12,
-    }
-    perf_count = mapping.get(count, max(1, count - min(4, count // 3)))
-    perf_count = min(perf_count, count)
+    levels = perf_levels()
+    if levels is not None:
+        perf_count, eff_count = levels
+        if perf_count + eff_count == count:
+            # Apple Silicon reports efficiency cores first in the per-cpu arrays
+            # exposed through psutil/host_processor_info.
+            eff_cores = per_core[:eff_count]
+            perf_cores = per_core[eff_count:]
+            return perf_cores, eff_cores
+
+    eff_count = min(4, count // 3)
+    perf_count = max(1, count - eff_count)
     return per_core[:perf_count], per_core[perf_count:]
+
+
+def _process_memory_bytes(process: psutil.Process) -> int:
+    footprint = process_phys_footprint(process.pid)
+    if footprint is not None:
+        return footprint
+
+    try:
+        full_info = process.memory_full_info()
+    except (psutil.Error, OSError):
+        full_info = None
+    if full_info is not None and hasattr(full_info, "uss"):
+        return int(full_info.uss)
+
+    try:
+        info = process.memory_info()
+    except (psutil.Error, OSError):
+        return 0
+    return int(info.rss)
 
 
 def _format_idle(seconds_idle: int) -> str:

@@ -25,17 +25,30 @@ class InsightActionRequested(Message):
 
 class InsightsPanel(Static):
     sample: reactive[Sample | None] = reactive(None)
+    vibe_mode: reactive[bool] = reactive(False)
 
     def push(self, sample: Sample) -> None:
         self.sample = sample
 
+    def watch_vibe_mode(self, _old: bool, _new: bool) -> None:
+        self.refresh()
+
     def render(self) -> RenderableType:
         s = self.sample
+        title = (
+            f"[bold {theme.PALETTE['primary']}]"
+            f"{'what is going on' if self.vibe_mode else 'insights · rules-based'}"
+            f"[/]"
+        )
         if s is None or not s.insights:
             return Panel(
-                Text("No insights yet.", style=theme.PALETTE["muted"]),
+                Text(
+                    "Looks calm. Nothing needs your attention." if self.vibe_mode
+                    else "No insights yet.",
+                    style=theme.PALETTE["muted"],
+                ),
                 border_style=theme.PALETTE["border"],
-                title=f"[bold {theme.PALETTE['primary']}]insights[/]",
+                title=title,
                 title_align="left",
                 padding=(0, 1),
             )
@@ -47,7 +60,7 @@ class InsightsPanel(Static):
         return Panel(
             Group(*renderables),
             border_style=theme.PALETTE["border"],
-            title=f"[bold {theme.PALETTE['primary']}]insights · rules-based[/]",
+            title=title,
             title_align="left",
             padding=(0, 1),
         )
