@@ -34,6 +34,23 @@ class ActionRequested(Message):
         super().__init__()
 
 
+_PROC_COUNT_CACHE = {"value": 0, "stamp": 0.0}
+
+
+def _process_count_estimate() -> int:
+    """Cheap-ish process count for the footer. Updates at most every 5s
+    so we don't iterate all PIDs on every UI tick."""
+    import time as _t
+    import psutil as _ps
+    if _t.monotonic() - _PROC_COUNT_CACHE["stamp"] > 5.0:
+        try:
+            _PROC_COUNT_CACHE["value"] = sum(1 for _ in _ps.pids())
+        except Exception:
+            pass
+        _PROC_COUNT_CACHE["stamp"] = _t.monotonic()
+    return _PROC_COUNT_CACHE["value"]
+
+
 def _state_label_vibe(row: ProcessRow) -> str:
     """Plain-English version of the technical state."""
     s = row.state
@@ -123,12 +140,14 @@ class ProcessesPanel(Vertical):
         super().__init__(**kwargs)
         self._table = DataTable(zebra_stripes=True, cursor_type="row", header_height=1)
         self._title = Static("", id="processes-title")
+        self._footer = Static("", id="processes-footer")
         self._rows_by_key: dict[int, ProcessRow] = {}
         self._columns_for_mode: str | None = None
 
     def compose(self):
         yield self._title
         yield self._table
+        yield self._footer
 
     def on_mount(self) -> None:
         self._configure_columns()
@@ -200,12 +219,44 @@ class ProcessesPanel(Vertical):
             self._rows_by_key[row.pid] = row
             self._table.add_row(*self._cells_for(row), key=str(row.pid), height=1)
 
+        self._update_footer(sample, rows_to_show)
+
         # Restore cursor
         if rows_to_show and saved_row is not None:
             try:
                 self._table.move_cursor(row=min(saved_row, len(rows_to_show) - 1))
             except Exception:
                 pass
+
+    def _update_footer(self, sample: Sample, rows: list[ProcessRow]) -> None:
+        """Honest accounting line. Per-process numbers are phys_footprint —
+        the same ledger Activity Monitor's Memory column uses. They do NOT
+        sum to App Memory because the system-wide total includes shared
+        anonymous pages, owned-but-unmapped memory, and kernel allocations
+        that aren't attributable to any single process. The same gap exists
+        in Activity Monitor — Apple's `footprint(1)` man page documents this."""
+        shown_sum = sum(r.rss_gb for r in rows)
+        app_total = sample.memory.app_gb
+        gap = max(0, app_total - shown_sum)
+
+        if self.vibe_mode:
+            footer = (
+                f"  [{theme.PALETTE['muted']}]Showing {len(rows)} apps · "
+                f"sum [bold {theme.PALETTE['fg']}]{shown_sum:.1f} GB[/]   "
+                f"App Memory total [bold {theme.PALETTE['fg']}]{app_total:.1f} GB[/]   "
+                f"the [bold]{gap:.1f} GB[/] difference is shared system memory + many "
+                f"small background apps · macOS does the same in Activity Monitor[/]"
+            )
+        else:
+            footer = (
+                f"  [{theme.PALETTE['muted']}]"
+                f"shown sum [bold {theme.PALETTE['fg']}]{shown_sum:.1f} GB[/]  ·  "
+                f"App Memory [bold {theme.PALETTE['fg']}]{app_total:.1f} GB[/]  ·  "
+                f"unaccounted [bold]{gap:.1f} GB[/] (shared dyld cache, kernel-owned, "
+                f"~{max(0, _process_count_estimate() - len(rows))} smaller processes) — "
+                f"same as Activity Monitor; per-process is phys_footprint, not a sum-to-total ledger[/]"
+            )
+        self._footer.update(Text.from_markup(footer))
 
     def _cells_for(self, row: ProcessRow) -> list:
         # Dot column — frontmost / paused / pinned indicator

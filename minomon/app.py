@@ -72,6 +72,9 @@ class MinoMonitorApp(App):
         height: 1;
         padding: 0 0 0 1;
     }}
+    #processes-footer {{
+        height: 1;
+    }}
     """
 
     BINDINGS = [
