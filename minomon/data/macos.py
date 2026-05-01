@@ -19,6 +19,69 @@ _KERN_SUCCESS = 0
 _MACH_PORT_NULL = 0
 _TASK_VM_INFO = 22
 
+# proc_pid_rusage flavors. RUSAGE_INFO_V6 is the latest macOS 12.0+ struct
+# and contains ri_phys_footprint at offset 19 * sizeof(uint64). This is the
+# same number Activity Monitor / footprint(1) / top -stats mem display.
+_RUSAGE_INFO_V6 = 6
+
+
+class _RUsageInfoV6(ctypes.Structure):
+    """rusage_info_v6 from <sys/resource.h>. Field order matters — must match
+    the kernel's exact layout. Fields after ri_phys_footprint are needed for
+    correct struct size but we only read ri_phys_footprint."""
+    _fields_ = [
+        ("ri_uuid",                       ctypes.c_uint8 * 16),
+        ("ri_user_time",                  ctypes.c_uint64),
+        ("ri_system_time",                ctypes.c_uint64),
+        ("ri_pkg_idle_wkups",             ctypes.c_uint64),
+        ("ri_interrupt_wkups",            ctypes.c_uint64),
+        ("ri_pageins",                    ctypes.c_uint64),
+        ("ri_wired_size",                 ctypes.c_uint64),
+        ("ri_resident_size",              ctypes.c_uint64),
+        ("ri_phys_footprint",             ctypes.c_uint64),  # ← what we want
+        ("ri_proc_start_abstime",         ctypes.c_uint64),
+        ("ri_proc_exit_abstime",          ctypes.c_uint64),
+        ("ri_child_user_time",            ctypes.c_uint64),
+        ("ri_child_system_time",          ctypes.c_uint64),
+        ("ri_child_pkg_idle_wkups",       ctypes.c_uint64),
+        ("ri_child_interrupt_wkups",      ctypes.c_uint64),
+        ("ri_child_pageins",              ctypes.c_uint64),
+        ("ri_child_elapsed_abstime",      ctypes.c_uint64),
+        ("ri_diskio_bytesread",           ctypes.c_uint64),
+        ("ri_diskio_byteswritten",        ctypes.c_uint64),
+        ("ri_cpu_time_qos_default",       ctypes.c_uint64),
+        ("ri_cpu_time_qos_maintenance",   ctypes.c_uint64),
+        ("ri_cpu_time_qos_background",    ctypes.c_uint64),
+        ("ri_cpu_time_qos_utility",       ctypes.c_uint64),
+        ("ri_cpu_time_qos_legacy",        ctypes.c_uint64),
+        ("ri_cpu_time_qos_user_initiated",ctypes.c_uint64),
+        ("ri_cpu_time_qos_user_interactive", ctypes.c_uint64),
+        ("ri_billed_system_time",         ctypes.c_uint64),
+        ("ri_serviced_system_time",       ctypes.c_uint64),
+        ("ri_logical_writes",             ctypes.c_uint64),
+        ("ri_lifetime_max_phys_footprint",ctypes.c_uint64),
+        ("ri_instructions",               ctypes.c_uint64),
+        ("ri_cycles",                     ctypes.c_uint64),
+        ("ri_billed_energy",              ctypes.c_uint64),
+        ("ri_serviced_energy",            ctypes.c_uint64),
+        ("ri_interval_max_phys_footprint",ctypes.c_uint64),
+        ("ri_runnable_time",              ctypes.c_uint64),
+        ("ri_flags",                      ctypes.c_uint64),
+        # V5/V6 padding fields — present so sizeof() matches kernel expectation
+        ("ri_user_ptime",                 ctypes.c_uint64),
+        ("ri_system_ptime",               ctypes.c_uint64),
+        ("ri_pinstructions",              ctypes.c_uint64),
+        ("ri_pcycles",                    ctypes.c_uint64),
+        ("ri_energy_nj",                  ctypes.c_uint64),
+        ("ri_penergy_nj",                 ctypes.c_uint64),
+        ("ri_secure_time_in_system",      ctypes.c_uint64),
+        ("ri_secure_ptime_in_system",     ctypes.c_uint64),
+        ("ri_neural_footprint",           ctypes.c_uint64),
+        ("ri_lifetime_max_neural_footprint", ctypes.c_uint64),
+        ("ri_interval_max_neural_footprint", ctypes.c_uint64),
+        ("ri_reserved",                   ctypes.c_uint64 * 9),
+    ]
+
 
 class _TimeValue(ctypes.Structure):
     _fields_ = [
@@ -76,6 +139,15 @@ _LIBSYSTEM.sysctlbyname.argtypes = [
 ]
 _LIBSYSTEM.sysctlbyname.restype = ctypes.c_int
 
+# proc_pid_rusage works for any process the user owns — no entitlements
+# required. This is what footprint(1) uses internally.
+_LIBSYSTEM.proc_pid_rusage.argtypes = [
+    ctypes.c_int,         # pid
+    ctypes.c_int,         # flavor (RUSAGE_INFO_V6)
+    ctypes.c_void_p,      # buffer (rusage_info_t)
+]
+_LIBSYSTEM.proc_pid_rusage.restype = ctypes.c_int
+
 
 def vm_stat() -> dict[str, int]:
     global _VM_STAT_CACHE
@@ -123,26 +195,21 @@ def memory_pressure() -> str:
 
 
 def process_phys_footprint(pid: int) -> int | None:
-    task = ctypes.c_uint(_MACH_PORT_NULL)
-    task_self = ctypes.c_uint.in_dll(_LIBSYSTEM, "mach_task_self_").value
-    kr = _LIBSYSTEM.task_for_pid(task_self, pid, ctypes.byref(task))
-    if kr != _KERN_SUCCESS or task.value == _MACH_PORT_NULL:
-        return None
+    """Return the per-process physical footprint in bytes — the same number
+    Activity Monitor's "Memory" column shows. Uses `proc_pid_rusage` with
+    RUSAGE_INFO_V6, which works for any process owned by the current user
+    (no entitlements required, unlike Mach `task_for_pid`).
 
-    try:
-        info = _TaskVmInfo()
-        count = ctypes.c_uint(_TASK_VM_INFO_COUNT)
-        kr = _LIBSYSTEM.task_info(
-            task,
-            _TASK_VM_INFO,
-            ctypes.byref(info),
-            ctypes.byref(count),
-        )
-        if kr != _KERN_SUCCESS:
-            return None
-        return int(info.phys_footprint)
-    finally:
-        _LIBSYSTEM.mach_port_deallocate(task_self, task)
+    Returns None if the call fails (process gone, denied, etc.) so callers
+    can fall back to whatever they like."""
+    info = _RUsageInfoV6()
+    rc = _LIBSYSTEM.proc_pid_rusage(pid, _RUSAGE_INFO_V6, ctypes.byref(info))
+    if rc != 0:
+        return None
+    footprint = int(info.ri_phys_footprint)
+    if footprint == 0:
+        return None  # let caller fall back rather than show "0 B"
+    return footprint
 
 
 def perf_levels() -> tuple[int, int] | None:
