@@ -117,12 +117,22 @@ class Sampler:
         total_bytes = psutil.virtual_memory().total
         total_pages = total_bytes // _PAGE_SIZE
 
+        # Match Activity Monitor's Memory tab footer exactly:
+        #   App Memory       = anonymous pages (private memory used by apps)
+        #   Wired Memory     = pages wired down (kernel-locked)
+        #   Compressed       = pages OCCUPIED by compressor (actual RAM in use), NOT
+        #                      pages STORED in compressor (uncompressed equivalent).
+        #                      `top` reports this same number as the "compressor" figure.
+        #   Cached Files     = file-backed + speculative + purgeable
+        #   Free             = pages free (do NOT subtract speculative — it's a
+        #                      separate category that vm_stat already breaks out)
         speculative_pages = stats.get("specul", 0)
-        free_pages = max(0, stats.get("free", 0) - speculative_pages)
+        free_pages = max(0, stats.get("free", 0))
         wired_pages = stats.get("wired", 0)
-        compressed_pages = stats.get("cmprssed", 0)
+        # `cmprssor` (occupied) is what AM/top show; `cmprssed` is original size.
+        compressed_pages = stats.get("cmprssor", stats.get("cmprssed", 0))
         cached_pages = stats.get("file-backed", 0) + speculative_pages + stats.get("prgable", 0)
-        app_pages = max(0, total_pages - free_pages - wired_pages - compressed_pages - cached_pages)
+        app_pages = stats.get("anonymous", 0)
 
         total_gb = total_bytes / (1024 ** 3)
         free_gb = _pages_to_gb(free_pages)
