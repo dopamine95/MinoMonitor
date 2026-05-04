@@ -141,6 +141,18 @@ def _action_cell(row: ProcessRow, vibe: bool) -> Text:
     return Text.from_markup("  ".join(parts))
 
 
+# Sort modes the user can cycle through with `s`. Each tuple is
+# (key, label, attr_name on ProcessRow). When attr is None we fall back
+# to RSS as the secondary key. Δ values may be None for new processes —
+# we treat None as 0 for sorting so they sink below growers.
+_SORT_MODES = (
+    ("memory", "by Memory",      "rss_gb"),
+    ("d1m",    "by Δ memory 1m", "delta_1m_gb"),
+    ("d5m",    "by Δ memory 5m", "delta_5m_gb"),
+    ("d15m",   "by Δ memory 15m","delta_15m_gb"),
+)
+
+
 class ProcessesPanel(Vertical):
     """A title row + DataTable. Toggleable vibe / techie display modes."""
 
@@ -148,11 +160,13 @@ class ProcessesPanel(Vertical):
         Binding("c", "calm_selected",  "Calm", show=True),
         Binding("f", "freeze_selected", "Pause", show=True),
         Binding("u", "uncalm_selected", "Resume", show=True),
+        Binding("s", "cycle_sort", "Sort", show=True),
         Binding("Q", "quit_selected", "Quit app", show=False),
     ]
 
     sample: reactive[Sample | None] = reactive(None)
     vibe_mode: reactive[bool] = reactive(False)
+    sort_index: reactive[int] = reactive(0)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -173,16 +187,30 @@ class ProcessesPanel(Vertical):
         self._table.styles.background = theme.PALETTE["bg_panel"]
         self._title.update(self._title_markup(0))
 
+    def _columns_signature(self) -> str:
+        """Cache key for the configured column layout. Re-running the
+        column setup is expensive (clears the table); only do it when
+        either the mode or the sort window flips."""
+        return f"{'vibe' if self.vibe_mode else 'techie'}|sort={_SORT_MODES[self.sort_index][0]}"
+
     def _configure_columns(self) -> None:
         """Add the right columns for the current mode. Called whenever the
         mode flips or on first mount."""
-        if self._columns_for_mode == ("vibe" if self.vibe_mode else "techie"):
+        if self._columns_for_mode == self._columns_signature():
             return
         self._table.clear(columns=True)
+        attr = _SORT_MODES[self.sort_index][2]
+        delta_label = {
+            "delta_1m_gb":  "Δ 1m",
+            "delta_5m_gb":  "Δ 5m",
+            "delta_15m_gb": "Δ 15m",
+        }.get(attr)
         if self.vibe_mode:
             self._table.add_column("",        width=2,  key="dot")
             self._table.add_column("App",                key="name")
             self._table.add_column("Memory",  width=12, key="mem")
+            if delta_label:
+                self._table.add_column(delta_label, width=11, key="delta")
             self._table.add_column("CPU",     width=8,  key="cpu")
             self._table.add_column("Doing",              key="state")
             self._table.add_column("Action",             key="action")
@@ -190,24 +218,37 @@ class ProcessesPanel(Vertical):
             self._table.add_column("",        width=2,  key="dot")
             self._table.add_column("Name",               key="name")
             self._table.add_column("Memory",  width=10, key="mem")
+            if delta_label:
+                self._table.add_column(delta_label, width=11, key="delta")
             self._table.add_column("CPU",     width=7,  key="cpu")
             self._table.add_column("State",   width=18, key="state")
             self._table.add_column("Bundle",  width=30, key="bundle")
             self._table.add_column("",                   key="action")
-        self._columns_for_mode = "vibe" if self.vibe_mode else "techie"
+        self._columns_for_mode = self._columns_signature()
 
     def _title_markup(self, n: int) -> Text:
+        sort_label = _SORT_MODES[self.sort_index][1]
         if self.vibe_mode:
+            growth_hint = (
+                ""
+                if self.sort_index == 0
+                else f" · [bold {theme.SEVERITY['warn']}]{sort_label}[/]"
+            )
             return Text.from_markup(
                 f"[bold {theme.PALETTE['primary']}]Apps using your Mac[/]   "
-                f"[{theme.PALETTE['muted']}]{n} shown · "
+                f"[{theme.PALETTE['muted']}]{n} shown{growth_hint} · "
                 f"[bold]↑/↓[/] pick · [bold]f[/] pause · [bold]u[/] resume · "
-                f"[bold]v[/] switch view[/]"
+                f"[bold]s[/] sort · [bold]v[/] switch view[/]"
             )
+        sort_chunk = (
+            ""
+            if self.sort_index == 0
+            else f"  ·  sorted [bold {theme.SEVERITY['warn']}]{sort_label}[/]"
+        )
         return Text.from_markup(
             f"[bold {theme.PALETTE['primary']}]TOP PROCESSES[/]   "
-            f"[{theme.PALETTE['muted']}]{n} shown · "
-            f"[bold]c[/]alm  [bold]f[/]reeze  [bold]u[/]ncalm  Shift-[bold]Q[/] quit-app · "
+            f"[{theme.PALETTE['muted']}]{n} shown{sort_chunk} · "
+            f"[bold]c[/]alm  [bold]f[/]reeze  [bold]u[/]ncalm  [bold]s[/]ort  Shift-[bold]Q[/] quit-app · "
             f"[bold]v[/] vibe view[/]"
         )
 
@@ -220,6 +261,19 @@ class ProcessesPanel(Vertical):
         if self.sample is not None:
             self._refresh_table(self.sample)
 
+    def watch_sort_index(self, _old: int, _new: int) -> None:
+        self._configure_columns()
+        if self.sample is not None:
+            self._refresh_table(self.sample)
+        try:
+            label = _SORT_MODES[_new][1]
+            self.app.notify(f"Sorted {label}", timeout=2)
+        except Exception:
+            pass
+
+    def action_cycle_sort(self) -> None:
+        self.sort_index = (self.sort_index + 1) % len(_SORT_MODES)
+
     def _refresh_table(self, sample: Sample) -> None:
         # Save cursor position so the user doesn't lose their place each tick
         try:
@@ -230,7 +284,19 @@ class ProcessesPanel(Vertical):
         self._configure_columns()
         self._table.clear()
         self._rows_by_key = {}
-        rows_to_show = sample.processes[:30]
+
+        # If the user picked a growth-based sort, re-rank by that delta
+        # (None deltas sort last). RSS sort is the default and matches what
+        # the sampler already produced.
+        rows_in = sample.processes
+        attr = _SORT_MODES[self.sort_index][2]
+        if attr != "rss_gb":
+            rows_in = sorted(
+                sample.processes,
+                key=lambda r: (getattr(r, attr) is not None, getattr(r, attr) or 0),
+                reverse=True,
+            )
+        rows_to_show = rows_in[:30]
         self._title.update(self._title_markup(len(rows_to_show)))
 
         for row in rows_to_show:
@@ -317,10 +383,38 @@ class ProcessesPanel(Vertical):
 
         action = _action_cell(row, vibe=self.vibe_mode)
 
+        # Delta cell only present in growth-sort mode
+        delta_cell = None
+        attr = _SORT_MODES[self.sort_index][2]
+        if attr in ("delta_1m_gb", "delta_5m_gb", "delta_15m_gb"):
+            delta_val = getattr(row, attr)
+            delta_cell = self._format_delta(delta_val)
+
         if self.vibe_mode:
-            return [dot, name, mem, cpu, state, action]
+            cells = [dot, name, mem]
+            if delta_cell is not None:
+                cells.append(delta_cell)
+            cells.extend([cpu, state, action])
+            return cells
+
         bundle = Text((row.bundle_id or "")[:30], style=theme.PALETTE["dim"])
-        return [dot, name, mem, cpu, state, bundle, action]
+        cells = [dot, name, mem]
+        if delta_cell is not None:
+            cells.append(delta_cell)
+        cells.extend([cpu, state, bundle, action])
+        return cells
+
+    @staticmethod
+    def _format_delta(value: float | None) -> Text:
+        if value is None:
+            return Text("—", style=theme.PALETTE["dim"])
+        if abs(value) < 0.01:
+            return Text("±0", style=theme.PALETTE["muted"])
+        if value > 0:
+            color = theme.SEVERITY["critical"] if value >= 1.0 else theme.SEVERITY["warn"]
+            return Text(f"↑ {value:+.2f} GB", style=color)
+        # shrinking — green is welcome
+        return Text(f"↓ {value:+.2f} GB", style=theme.SEVERITY["ok"])
 
     # ----- Action bindings -----
 

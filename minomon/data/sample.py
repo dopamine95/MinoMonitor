@@ -71,6 +71,14 @@ class ProcessRow:
     # The UI uses this to render a "0:23 / 1:00" style countdown.
     pause_total_seconds: Optional[int] = None
     pause_resume_in: Optional[int] = None
+    # Memory growth deltas in GB. Positive = grew since the lookback window
+    # started, negative = shrunk. None when we don't have enough history
+    # yet (process too new, or monitor just started). Sampler keeps a
+    # 16-min ring of (ts, rss_gb) per PID; group rows aggregate child
+    # deltas by sum. Used by the UI's growth-sort modes ('s' cycles).
+    delta_1m_gb: Optional[float] = None
+    delta_5m_gb: Optional[float] = None
+    delta_15m_gb: Optional[float] = None
 
 
 @dataclass

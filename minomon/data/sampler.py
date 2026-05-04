@@ -44,6 +44,11 @@ class Sampler:
         self._task: asyncio.Task | None = None
         self._process_meta: dict[int, _ProcessMeta] = {}
         self._last_active: dict[int, float] = {}
+        # Per-PID memory history: deque of (timestamp, rss_gb) entries.
+        # Used to compute Δ memory over 1m / 5m / 15m windows for the
+        # 'sort by growth' view. We keep ~16 minutes per process so the
+        # 15m delta has at least one comparison sample.
+        self._mem_history: dict[int, deque[tuple[float, float]]] = {}
         self._previous_vm_stats: dict[str, int] | None = None
         self._previous_vm_time: float | None = None
         self._powermetrics = _PowermetricsReader()
@@ -268,12 +273,17 @@ class Sampler:
                             pause_total = max(1, int(resume_at - paused_at))
                             pause_remain = max(0, int(resume_at - now))
 
+                rss_gb = round(footprint / (1024 ** 3), 2)
+
+                # Record memory history and compute growth deltas.
+                d1m, d5m, d15m = self._update_mem_history(pid, now, rss_gb)
+
                 rows.append(
                     ProcessRow(
                         pid=pid,
                         start_unix=meta.start_unix,
                         name=meta.name,
-                        rss_gb=round(footprint / (1024 ** 3), 2),
+                        rss_gb=rss_gb,
                         cpu_pct=round(cpu_pct, 1),
                         state=state,
                         pinned=pinned,
@@ -284,6 +294,9 @@ class Sampler:
                         child_pids=[(pid, meta.start_unix)],
                         pause_total_seconds=pause_total,
                         pause_resume_in=pause_remain,
+                        delta_1m_gb=d1m,
+                        delta_5m_gb=d5m,
+                        delta_15m_gb=d15m,
                     )
                 )
             except (psutil.Error, OSError):
@@ -291,11 +304,51 @@ class Sampler:
 
         self._process_meta = {pid: meta for pid, meta in self._process_meta.items() if pid in current_pids}
         self._last_active = {pid: ts for pid, ts in self._last_active.items() if pid in current_pids}
+        # Drop history for PIDs that aren't in the current top set so the
+        # dict doesn't grow unbounded over a long session.
+        self._mem_history = {
+            pid: hist for pid, hist in self._mem_history.items() if pid in current_pids
+        }
 
         # Roll helpers into their parent app, then trim to top_n.
         grouped = _group_rows(rows)
         grouped.sort(key=lambda r: r.rss_gb, reverse=True)
         return grouped[: self.top_n]
+
+    # Per-PID memory history is sampled at 1 Hz and trimmed to ~16 minutes.
+    # That's ~1000 samples × 16 bytes per process × ~90 processes = ~1.5 MB
+    # steady-state, which is negligible.
+    _MEM_HISTORY_KEEP_SECONDS = 16 * 60
+    _DELTA_WINDOWS_SECONDS = (60, 300, 900)  # 1m, 5m, 15m
+
+    def _update_mem_history(
+        self, pid: int, now: float, rss_gb: float
+    ) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        """Append the current sample to this PID's history, evict samples
+        older than 16 minutes, and return the (Δ1m, Δ5m, Δ15m) growths."""
+        hist = self._mem_history.get(pid)
+        if hist is None:
+            hist = deque()
+            self._mem_history[pid] = hist
+        hist.append((now, rss_gb))
+        cutoff = now - self._MEM_HISTORY_KEEP_SECONDS
+        while hist and hist[0][0] < cutoff:
+            hist.popleft()
+
+        deltas: list[Optional[float]] = []
+        for window in self._DELTA_WINDOWS_SECONDS:
+            target = now - window
+            past_rss = None
+            for ts, sample_rss in hist:
+                if ts >= target:
+                    past_rss = sample_rss
+                    break
+            if past_rss is None:
+                # Not enough history yet to fill this window
+                deltas.append(None)
+            else:
+                deltas.append(round(rss_gb - past_rss, 3))
+        return deltas[0], deltas[1], deltas[2]
 
     def _meta_for_process(self, process: psutil.Process) -> _ProcessMeta:
         cached = self._process_meta.get(process.pid)
@@ -491,6 +544,19 @@ def _group_rows(rows: list[ProcessRow]) -> list[ProcessRow]:
             pause_total = None
             pause_remain = None
 
+        # Aggregate growth deltas. Sum across children if at least one
+        # member has a value for that window; None if every member is too
+        # new to have data.
+        def _agg(window_attr: str) -> Optional[float]:
+            vals = [getattr(m, window_attr) for m in members if getattr(m, window_attr) is not None]
+            if not vals:
+                return None
+            return round(sum(vals), 3)
+
+        delta_1m = _agg("delta_1m_gb")
+        delta_5m = _agg("delta_5m_gb")
+        delta_15m = _agg("delta_15m_gb")
+
         out.append(
             ProcessRow(
                 pid=primary.pid,
@@ -507,6 +573,9 @@ def _group_rows(rows: list[ProcessRow]) -> list[ProcessRow]:
                 child_pids=[(m.pid, m.start_unix) for m in members],
                 pause_total_seconds=pause_total,
                 pause_resume_in=pause_remain,
+                delta_1m_gb=delta_1m,
+                delta_5m_gb=delta_5m,
+                delta_15m_gb=delta_15m,
             )
         )
     return out
