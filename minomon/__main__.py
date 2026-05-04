@@ -5,6 +5,7 @@ Modes:
   (default)     interactive Textual TUI dashboard
   --stub        TUI with fake oscillating data (UI dev / preview)
   --snapshot    one-shot text summary, no TUI; prints and exits
+  --advise      ask Claude Code for rule-change suggestions; prints and exits
   --vibe        start the TUI with vibe view enabled
 """
 
@@ -25,6 +26,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Print a one-shot text summary and exit (no TUI).",
     )
     parser.add_argument(
+        "--advise",
+        action="store_true",
+        help="Ask Claude Code for rule-change suggestions based on your "
+             "actions log + config + current state. Opt-in; configure "
+             "in ~/.minomonitor/config.toml.",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="With --snapshot: emit plain ASCII output (no ANSI styling).",
@@ -42,6 +50,10 @@ def main(argv: list[str] | None = None) -> int:
              "snapshot uses 12 unless overridden).",
     )
     args = parser.parse_args(argv)
+
+    if args.advise:
+        from .advisor import run_advise
+        return run_advise()
 
     if args.snapshot:
         from .snapshot import run_snapshot

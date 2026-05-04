@@ -35,6 +35,37 @@ def load_user_config() -> dict[str, list[str]]:
     return {"pin": pin, "unpin": unpin}
 
 
+def load_advisor_config() -> dict:
+    """Reads the [advisor] section. Default-disabled — `minomon advise`
+    is a no-op until the user explicitly opts in. Returns:
+
+        {
+            "engine":  "none" | "claude-code",
+            "timeout_seconds": int,
+        }
+    """
+    defaults = {"engine": "none", "timeout_seconds": 60}
+    if not CONFIG_PATH.exists():
+        return defaults
+    try:
+        with CONFIG_PATH.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return defaults
+    advisor = data.get("advisor")
+    if not isinstance(advisor, dict):
+        return defaults
+    engine = str(advisor.get("engine", "none")).strip().lower()
+    if engine not in {"none", "claude-code"}:
+        engine = "none"
+    try:
+        timeout = int(advisor.get("timeout_seconds", 60))
+        timeout = max(10, min(600, timeout))
+    except (TypeError, ValueError):
+        timeout = 60
+    return {"engine": engine, "timeout_seconds": timeout}
+
+
 def save_user_config(pin: Iterable[str], unpin: Iterable[str]) -> None:
     """Atomic write. Sorts and de-duplicates so the file stays clean
     after many edits."""
