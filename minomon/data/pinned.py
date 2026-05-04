@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -90,6 +91,38 @@ SOCKET_HEAVY_BUNDLE_IDS = {
 _TERMINAL_BUNDLE_IDS: set[str] = set()
 _TERMINAL_NAMES: set[str] = set()
 
+# User config: pins added/removed via the `p` keybinding, persisted at
+# ~/.minomonitor/config.toml. Loaded on demand so changes from another
+# session show up next refresh without a server-side poll.
+_USER_CONFIG_LOAD_INTERVAL = 5.0  # seconds — cheap file stat on each call
+_USER_PINS: set[str] = set()
+_USER_UNPINS: set[str] = set()
+_LAST_USER_CONFIG_LOAD: float = 0.0
+
+
+def _strip_group_suffix(name: str) -> str:
+    """Group rows render as 'Brave Browser ×8'. When matching against the
+    user pin/unpin lists we want the bare app name."""
+    return re.sub(r"\s*[×x]\s*\d+$", "", name).strip()
+
+
+def _refresh_user_config() -> None:
+    global _USER_PINS, _USER_UNPINS, _LAST_USER_CONFIG_LOAD
+    import time as _t
+    now = _t.monotonic()
+    if now - _LAST_USER_CONFIG_LOAD < _USER_CONFIG_LOAD_INTERVAL:
+        return
+    _LAST_USER_CONFIG_LOAD = now
+    try:
+        from .config import load_user_config
+        cfg = load_user_config()
+        _USER_PINS = set(cfg.get("pin", []))
+        _USER_UNPINS = set(cfg.get("unpin", []))
+    except Exception:
+        # Bad config => no user pins; never break the sampler over it.
+        _USER_PINS = set()
+        _USER_UNPINS = set()
+
 
 def add_terminal_app() -> None:
     bundle_id = lsappinfo_front()
@@ -100,11 +133,28 @@ def add_terminal_app() -> None:
         _TERMINAL_NAMES.add(term_program)
     for candidate in _parent_chain_bundle_ids():
         _TERMINAL_BUNDLE_IDS.add(candidate)
+    _refresh_user_config()
 
 
 def is_pinned(name: str, bundle_id: Optional[str]) -> bool:
+    _refresh_user_config()
     normalized_name = name.strip()
-    if normalized_name in PINNED_NAMES:
+    bare_name = _strip_group_suffix(normalized_name)
+
+    # 1. User unpin overrides the baked-in deny list. Always wins.
+    if normalized_name in _USER_UNPINS or bare_name in _USER_UNPINS:
+        return False
+    if bundle_id and bundle_id in _USER_UNPINS:
+        return False
+
+    # 2. User pin always pins, regardless of system list.
+    if normalized_name in _USER_PINS or bare_name in _USER_PINS:
+        return True
+    if bundle_id and bundle_id in _USER_PINS:
+        return True
+
+    # 3. Baked-in protections.
+    if normalized_name in PINNED_NAMES or bare_name in PINNED_NAMES:
         return True
     if bundle_id and bundle_id in PINNED_BUNDLE_IDS:
         return True
@@ -112,8 +162,20 @@ def is_pinned(name: str, bundle_id: Optional[str]) -> bool:
         return True
     if normalized_name and normalized_name in _TERMINAL_NAMES:
         return True
-    lowered = normalized_name.lower()
-    return lowered.endswith("terminal")
+    return normalized_name.lower().endswith("terminal")
+
+
+def is_user_pinned(name: str, bundle_id: Optional[str]) -> bool:
+    """True only when the pin comes from the user's config — used by the
+    `p` toggle to choose between 'add to user pin' and 'remove from user
+    pin'."""
+    _refresh_user_config()
+    bare_name = _strip_group_suffix(name.strip())
+    if name in _USER_PINS or bare_name in _USER_PINS:
+        return True
+    if bundle_id and bundle_id in _USER_PINS:
+        return True
+    return False
 
 
 def _parent_chain_bundle_ids() -> set[str]:

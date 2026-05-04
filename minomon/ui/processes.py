@@ -161,6 +161,7 @@ class ProcessesPanel(Vertical):
         Binding("f", "freeze_selected", "Pause", show=True),
         Binding("u", "uncalm_selected", "Resume", show=True),
         Binding("s", "cycle_sort", "Sort", show=True),
+        Binding("p", "toggle_pin", "Pin/unpin", show=True),
         Binding("Q", "quit_selected", "Quit app", show=False),
     ]
 
@@ -455,3 +456,59 @@ class ProcessesPanel(Vertical):
         if row is None or row.pinned:
             return
         self.post_message(ActionRequested("quit", row.pid, row.start_unix, row.name))
+
+    def action_toggle_pin(self) -> None:
+        """Add or remove the selected row from the user pin list. Three
+        cases:
+          - Currently user-pinned  → remove (back to default behavior)
+          - Currently system-pinned → add to user 'unpin' list (so future
+            sessions can manage it)
+          - Otherwise               → add to user 'pin' list
+        """
+        row = self._selected_row()
+        if row is None:
+            return
+
+        from ..data.config import add_pin, remove_pin, add_unpin, remove_unpin
+        from ..data.pinned import is_user_pinned, _strip_group_suffix
+
+        # Prefer bundle_id (stable across app versions), but for shared
+        # interpreter bundles (org.python.*, org.nodejs.*, etc.) the bundle
+        # id is the language — pinning it would pin every Python script,
+        # not just this one. In that case use the bare name from the row,
+        # which already encodes the script via _human_name.
+        bid = row.bundle_id or ""
+        is_interpreter_bundle = bid.startswith((
+            "org.python.", "org.nodejs.", "ruby-lang.org.", "com.oracle.java.",
+        ))
+        if bid and not is_interpreter_bundle:
+            key = bid
+        else:
+            key = _strip_group_suffix(row.name)
+        if not key:
+            self.app.notify("Can't pin — no stable identifier.", severity="warning")
+            return
+
+        try:
+            if is_user_pinned(row.name, row.bundle_id):
+                remove_pin(key)
+                self.app.notify(f"Unpinned {row.name}", timeout=2)
+            elif row.pinned:
+                # System-pinned: add an unpin entry so the user can manage it
+                add_unpin(key)
+                self.app.notify(
+                    f"Removed {row.name} from system protections — you can now manage it.",
+                    timeout=4,
+                )
+            else:
+                add_pin(key)
+                # Make sure unpin doesn't override us
+                remove_unpin(key)
+                self.app.notify(f"Pinned {row.name} — protected from actions.", timeout=3)
+        except Exception as e:
+            self.app.notify(f"Pin toggle failed: {e}", severity="error", timeout=4)
+            return
+
+        # Force a refresh so the row's pinned status updates immediately
+        if self.sample is not None:
+            self._refresh_table(self.sample)
