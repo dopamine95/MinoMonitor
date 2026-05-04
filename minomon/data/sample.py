@@ -59,6 +59,12 @@ class ProcessRow:
     holds_audio: bool = False   # heuristic: in audio_clients set
     holds_socket: bool = False  # heuristic: known WebSocket-heavy app
     seconds_idle: int = 0
+    # Aggregation: when an app has helper / XPC / renderer subprocesses
+    # (Brave, Chrome, Xcode, etc.), they get rolled up under their parent
+    # app row. `child_pids` is the full set including the parent PID, used
+    # by actions to fan out (e.g. "Pause Brave" stops all helpers, not
+    # just one). For ungrouped processes the list contains a single tuple.
+    child_pids: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass

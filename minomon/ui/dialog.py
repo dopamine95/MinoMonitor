@@ -57,12 +57,28 @@ class ConfirmAction(ModalScreen[bool]):
                 warnings.append("This app holds an audio session — playback may need reinit on thaw.")
             if self.row.holds_socket:
                 warnings.append("This app holds a live WebSocket — server may time out at ~60s.")
+        # If the row groups several helpers, the action will fan out — make
+        # that explicit so the user knows what they're agreeing to.
+        n = len(self.row.child_pids)
+        if n > 1 and self.action in ("freeze", "calm"):
+            warnings.append(
+                f"This app has {n} processes (parent + {n - 1} helpers). "
+                f"The action will be applied to all of them."
+            )
+
+        target_line = (
+            f"[{theme.PALETTE['muted']}]Target:[/] [bold]{self.row.name}[/]  "
+            + (
+                f"[{theme.PALETTE['dim']}]{n} processes[/]"
+                if n > 1 else
+                f"[{theme.PALETTE['dim']}]pid {self.row.pid}[/]"
+            )
+        )
 
         body = Vertical(
             Static(f"[bold {theme.PALETTE['primary']}]{title}[/]"),
             Static(""),
-            Static(f"[{theme.PALETTE['muted']}]Target:[/] [bold]{self.row.name}[/]  "
-                   f"[{theme.PALETTE['dim']}]pid {self.row.pid}[/]"),
+            Static(target_line),
             Static(f"[{theme.PALETTE['fg']}]{desc}[/]"),
             Static(""),
             *[Static(f"[{theme.SEVERITY['warn']}]{theme.GLYPHS.icon_warn} {w}[/]") for w in warnings],

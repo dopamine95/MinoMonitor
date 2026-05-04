@@ -152,7 +152,10 @@ class MinoMonitorApp(App):
             pass
 
     async def on_action_requested(self, message: ActionRequested) -> None:
-        """Routed from the process table."""
+        """Routed from the process table. Fans out across all child pids
+        when the row represents a group (Brave + 8 helpers, Xcode + 4
+        XPC services, etc.) so the action covers the whole app, not just
+        the parent."""
         sample = self.sampler.latest
         if sample is None:
             return
@@ -161,14 +164,24 @@ class MinoMonitorApp(App):
             self.notify("Cannot act on pinned process.", severity="warning")
             return
 
-        # Calm/uncalm are reversible & low-risk — skip the confirm dialog.
+        # Quit goes through the OS app shutdown (osascript) — that already
+        # cascades to children, so we always operate on the parent only.
+        # Calm / Pause / Resume need to fan out to each helper because
+        # SIGSTOP/taskpolicy don't propagate to children.
+        targets = (
+            [(message.pid, message.start_unix)]
+            if message.action == "quit"
+            else list(row.child_pids) or [(message.pid, message.start_unix)]
+        )
+
+        # Calm/uncalm/thaw are reversible & low-risk — skip the confirm dialog.
         if message.action in ("calm", "uncalm", "thaw"):
-            await self._dispatch(message.action, message.pid, message.start_unix, message.name)
+            await self._dispatch_many(message.action, targets, message.name)
             return
 
         confirmed = await self.push_screen_wait(ConfirmAction(message.action, row))
         if confirmed:
-            await self._dispatch(message.action, message.pid, message.start_unix, message.name)
+            await self._dispatch_many(message.action, targets, message.name)
 
     async def on_insight_action_requested(self, message: InsightActionRequested) -> None:
         payload = message.payload
@@ -223,6 +236,70 @@ class MinoMonitorApp(App):
         if not pid:
             return
         await self._dispatch(action, pid, start_unix, name)
+
+    async def _dispatch_many(
+        self,
+        action: str,
+        targets: list[tuple[int, int]],
+        group_name: str,
+    ) -> None:
+        """Run one action across N pids and post a single summary toast.
+        For a group of one, behaves identically to the old per-pid dispatch."""
+        if len(targets) == 1:
+            pid, start_unix = targets[0]
+            await self._dispatch(action, pid, start_unix, group_name)
+            return
+
+        ok_count = 0
+        failures: list[str] = []
+        for pid, start_unix in targets:
+            try:
+                async with self._action_lock:
+                    result = await self._run_action(action, pid, start_unix)
+                if result is None or result.success:
+                    ok_count += 1 if result is not None else 0
+                else:
+                    failures.append(result.message)
+            except Exception as e:
+                failures.append(str(e))
+
+        total = len(targets)
+        if failures:
+            self.notify(
+                f"{theme.GLYPHS.icon_warn} {action} {group_name}: "
+                f"{ok_count} of {total} succeeded. "
+                f"First failure: {failures[0][:100]}",
+                severity="warning",
+                timeout=6,
+            )
+        else:
+            self.notify(
+                f"{theme.GLYPHS.icon_ok} {action} {group_name} ({total} processes)",
+                severity="information",
+                timeout=4,
+            )
+
+    async def _run_action(self, action: str, pid: int, start_unix: int):
+        """Single-pid action runner. Returns ActionResult or None for
+        unknown actions. Used by _dispatch_many to keep each individual
+        call lock-free at the loop level (the caller holds the lock once
+        per pid)."""
+        if action == "calm":
+            from .actions.calm import calm
+            return await calm(pid, start_unix)
+        if action == "uncalm":
+            from .actions.calm import uncalm
+            return await uncalm(pid, start_unix)
+        if action == "freeze":
+            from .actions.freeze import freeze
+            return await freeze(pid, start_unix)
+        if action == "thaw":
+            from .actions.freeze import thaw
+            return await thaw(pid, start_unix)
+        if action == "quit":
+            from .actions.quit import quit_app
+            return await quit_app(pid, start_unix)
+        return None
 
     async def _dispatch(self, action: str, pid: int, start_unix: int, name: str) -> None:
         async with self._action_lock:

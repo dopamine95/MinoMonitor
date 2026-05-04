@@ -194,6 +194,9 @@ class Sampler:
         )
 
     def _sample_processes(self, now: float, paused_pids: list[int], calmed_pids: list[int]) -> list[ProcessRow]:
+        # Collect more raw rows than we'll display (3x top_n) so apps with
+        # many helpers (Brave's renderers, Xcode's XPC services) all make
+        # the cut and end up grouped together rather than half-shown.
         front_bundle = lsappinfo_front()
         app_bundles = running_apps()
         paused_set = set(paused_pids)
@@ -217,8 +220,13 @@ class Sampler:
             return rows
         processes.sort(key=lambda item: item[0], reverse=True)
 
+        # Build raw rows for the top 3*N processes by individual footprint
+        # so that helper-heavy apps (Chrome/Brave/Xcode) all make the cut
+        # before grouping. We'll trim to top_n after grouping.
+        raw_limit = max(self.top_n * 3, 60)
+
         current_pids = set()
-        for footprint, process in processes[: self.top_n]:
+        for footprint, process in processes[: raw_limit]:
             try:
                 pid = process.pid
                 current_pids.add(pid)
@@ -262,6 +270,7 @@ class Sampler:
                         holds_audio=holds_audio,
                         holds_socket=holds_socket,
                         seconds_idle=seconds_idle,
+                        child_pids=[(pid, meta.start_unix)],
                     )
                 )
             except (psutil.Error, OSError):
@@ -269,7 +278,11 @@ class Sampler:
 
         self._process_meta = {pid: meta for pid, meta in self._process_meta.items() if pid in current_pids}
         self._last_active = {pid: ts for pid, ts in self._last_active.items() if pid in current_pids}
-        return rows
+
+        # Roll helpers into their parent app, then trim to top_n.
+        grouped = _group_rows(rows)
+        grouped.sort(key=lambda r: r.rss_gb, reverse=True)
+        return grouped[: self.top_n]
 
     def _meta_for_process(self, process: psutil.Process) -> _ProcessMeta:
         cached = self._process_meta.get(process.pid)
@@ -379,6 +392,93 @@ class _PowermetricsReader:
 
 def _pages_to_gb(pages: int) -> float:
     return pages * _PAGE_SIZE / (1024 ** 3)
+
+
+# State precedence used when collapsing helpers under a parent app: the
+# group inherits the most "alive" state across its members.
+_STATE_PRECEDENCE = {
+    "active":     6,
+    "playing":    5,
+    "foreground": 4,
+    "paused":     3,
+    "calmed":     2,
+    "idle":       1,
+}
+
+
+def _group_key(row: ProcessRow) -> str:
+    """Deterministic key that puts an app and its XPC/renderer/GPU helpers
+    in the same bucket. Returns a unique key when grouping doesn't apply
+    (no bundle id, or interpreter bundle where each script is its own row)."""
+    bid = row.bundle_id or ""
+    # Interpreters: don't lump every Python script together — each script
+    # is its own logical app. _human_name already encodes the script name.
+    if bid.startswith(_INTERPRETER_BUNDLE_PREFIXES):
+        return f"_interp_{row.name}"
+    if ".helper" in bid:
+        return bid.split(".helper", 1)[0]
+    if bid:
+        return bid
+    return f"_pid_{row.pid}"
+
+
+def _group_rows(rows: list[ProcessRow]) -> list[ProcessRow]:
+    """Aggregate rows by `_group_key`. Single-member groups pass through
+    unchanged. Multi-member groups produce one ProcessRow whose RAM/CPU is
+    summed, state is the most-alive state, and child_pids carries the full
+    pid list so actions can fan out across all members."""
+    groups: dict[str, list[ProcessRow]] = {}
+    for row in rows:
+        groups.setdefault(_group_key(row), []).append(row)
+
+    out: list[ProcessRow] = []
+    for members in groups.values():
+        if len(members) == 1:
+            out.append(members[0])
+            continue
+
+        # Pick the "primary" — prefer a member whose bundle id has no
+        # ".helper" segment (the parent app), otherwise the one with the
+        # largest footprint.
+        primary = next(
+            (m for m in members if m.bundle_id and ".helper" not in m.bundle_id),
+            None,
+        ) or max(members, key=lambda r: r.rss_gb)
+
+        rss_total = sum(m.rss_gb for m in members)
+        cpu_total = sum(m.cpu_pct for m in members)
+
+        def state_rank(state: str) -> int:
+            return _STATE_PRECEDENCE.get(state.split()[0], 0)
+
+        best = max(members, key=lambda r: state_rank(r.state))
+        any_pinned  = any(m.pinned       for m in members)
+        any_audio   = any(m.holds_audio  for m in members)
+        any_socket  = any(m.holds_socket for m in members)
+
+        # Helper-bearing apps with > 1 process get a count badge appended.
+        suffix = f" ×{len(members)}" if len(members) > 1 else ""
+        # If the primary's name has the script-bundle suffix (interpreter
+        # case), don't double-suffix — _group_key already keyed by name.
+        display_name = f"{primary.name}{suffix}"
+
+        out.append(
+            ProcessRow(
+                pid=primary.pid,
+                start_unix=primary.start_unix,
+                name=display_name,
+                rss_gb=round(rss_total, 2),
+                cpu_pct=round(cpu_total, 1),
+                state=best.state,
+                pinned=any_pinned,
+                bundle_id=primary.bundle_id,
+                holds_audio=any_audio,
+                holds_socket=any_socket,
+                seconds_idle=primary.seconds_idle,
+                child_pids=[(m.pid, m.start_unix) for m in members],
+            )
+        )
+    return out
 
 
 def _derive_pressure_level(compress_rate_mbps: float, swap_out_rate_mbps: float) -> str:
