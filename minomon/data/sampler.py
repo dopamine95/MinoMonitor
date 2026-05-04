@@ -21,7 +21,7 @@ from minomon.actions.freeze import read_pause_meta, resume_orphaned_paused_proce
 from .insights import build_insights
 from .macos import lsappinfo_front, memory_pressure, perf_levels, process_phys_footprint, running_apps, vm_stat
 from .pinned import AUDIO_BUNDLE_IDS, SOCKET_HEAVY_BUNDLE_IDS, add_terminal_app, is_pinned
-from .sample import CassieStatus, CPUSample, GPUSample, MemorySample, ProcessRow, Sample
+from .sample import BatterySample, CassieStatus, CPUSample, GPUSample, MemorySample, ProcessRow, Sample
 
 
 _CASSIE_PATH = Path.home() / ".cassie" / "status.json"
@@ -100,6 +100,7 @@ class Sampler:
         cpu = self._sample_cpu()
         gpu = self._powermetrics.sample
         cassie = self._sample_cassie(timestamp)
+        battery = self._sample_battery()
         prune_invalid_calmed_sentinels()
         paused_pids = [pid for pid, _, _ in list_paused_sentinels()]
         calmed_pids = [pid for pid, _, _ in list_calmed_sentinels()]
@@ -113,9 +114,32 @@ class Sampler:
             gpu=gpu,
             processes=processes,
             cassie=cassie,
+            battery=battery,
             insights=insights,
             paused_pids=paused_pids,
             calmed_pids=calmed_pids,
+        )
+
+    def _sample_battery(self) -> BatterySample:
+        """Read battery state via psutil. Returns available=False on
+        desktops or when the call fails (sensor access can be denied in
+        sandboxed environments). Cheap; no need to cache."""
+        try:
+            b = psutil.sensors_battery()
+        except (AttributeError, OSError):
+            return BatterySample(available=False)
+        if b is None:
+            return BatterySample(available=False)
+        secs_remaining: Optional[int]
+        if b.secsleft is None or b.secsleft < 0:
+            secs_remaining = None
+        else:
+            secs_remaining = int(b.secsleft)
+        return BatterySample(
+            available=True,
+            percent=round(float(b.percent), 1),
+            plugged_in=bool(b.power_plugged),
+            seconds_remaining=secs_remaining,
         )
 
     def _sample_memory(self, timestamp: float) -> MemorySample:

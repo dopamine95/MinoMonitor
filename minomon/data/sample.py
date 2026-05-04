@@ -35,6 +35,17 @@ class CPUSample:
 
 
 @dataclass
+class BatterySample:
+    """Power state for laptops. `available=False` on desktops, on Macs
+    where psutil can't read the battery, or in environments that strip
+    sensor access."""
+    available: bool
+    percent: float = 0.0
+    plugged_in: bool = False
+    seconds_remaining: Optional[int] = None  # None when charging or unknown
+
+
+@dataclass
 class GPUSample:
     """Apple Silicon SoC telemetry. Requires powermetrics (sudo). If
     powermetrics_available is False, all numbers are 0 and the UI shows
@@ -113,6 +124,7 @@ class Sample:
     gpu: GPUSample
     processes: list[ProcessRow]
     cassie: CassieStatus
+    battery: BatterySample
     insights: list[Insight]
     paused_pids: list[int] = field(default_factory=list)   # currently STOP'd by us
     calmed_pids: list[int] = field(default_factory=list)   # currently taskpolicy -b'd by us

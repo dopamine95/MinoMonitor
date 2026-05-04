@@ -192,6 +192,40 @@ class MetersPanel(Static):
                 ),
             )
 
+        # Battery row — laptops only. Hidden on desktops or when the OS
+        # doesn't expose battery sensors.
+        bat = s.battery
+        if bat.available:
+            if bat.percent >= 60:
+                bat_color = theme.SEVERITY["ok"]
+            elif bat.percent >= 25:
+                bat_color = theme.SEVERITY["warn"]
+            else:
+                bat_color = theme.SEVERITY["critical"]
+
+            if bat.plugged_in:
+                tail = (
+                    f"[{theme.PALETTE['muted']}]plugged in"
+                    f"{' · charging' if bat.percent < 100 else ' · full'}[/]"
+                )
+            elif bat.seconds_remaining is not None:
+                hours = bat.seconds_remaining // 3600
+                mins = (bat.seconds_remaining % 3600) // 60
+                if hours:
+                    tail = f"[{theme.PALETTE['muted']}]on battery · {hours}h {mins}m left[/]"
+                else:
+                    tail = f"[{theme.PALETTE['muted']}]on battery · {mins}m left[/]"
+            else:
+                tail = f"[{theme.PALETTE['muted']}]on battery · estimating…[/]"
+
+            right.add_row(
+                "",
+                Text.from_markup(
+                    f"[bold {theme.PALETTE['fg_strong']}]Battery[/] "
+                    f"[bold {bat_color}]{bat.percent:>4.0f}%[/]   {tail}"
+                ),
+            )
+
         # Optional integration: a local app can publish a small JSON file
         # advertising its loaded models / activity. When the file is present
         # we render a one-line summary. When absent, the row is omitted

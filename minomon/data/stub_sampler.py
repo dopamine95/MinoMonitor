@@ -14,8 +14,8 @@ from collections import deque
 from typing import Awaitable, Callable
 
 from .sample import (
-    CassieStatus, CPUSample, GPUSample, Insight, MemorySample, ProcessRow,
-    Sample,
+    BatterySample, CassieStatus, CPUSample, GPUSample, Insight, MemorySample,
+    ProcessRow, Sample,
 )
 
 
@@ -172,11 +172,19 @@ class StubSampler:
             message="No SIGSTOP'd processes orphaned from prior runs.",
         ))
 
+        battery = BatterySample(
+            available=True,
+            percent=72 + 10 * math.sin(t / 30),
+            plugged_in=(int(t) % 60) > 30,
+            seconds_remaining=int(2 * 3600 + 30 * 60),
+        )
+
         return Sample(
             timestamp=time.time(),
             memory=memory, cpu=cpu, gpu=gpu,
             processes=processes,
             cassie=cassie,
+            battery=battery,
             insights=insights,
             paused_pids=[],
             calmed_pids=[],

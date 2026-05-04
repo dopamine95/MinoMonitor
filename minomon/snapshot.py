@@ -112,6 +112,17 @@ def render_snapshot(sample: Sample, top_n: int = 12, use_color: bool = True) -> 
             f"[bold]GPU[/]       gpu {gpu.gpu_pct:.1f}%   ane {gpu.ane_pct:.1f}%   "
             f"temp {gpu.soc_temp_c:.0f}°C   fan {gpu.fan_rpm} rpm"
         )
+    if sample.battery.available:
+        b = sample.battery
+        if b.plugged_in:
+            tail = "plugged in" + (" · charging" if b.percent < 100 else " · full")
+        elif b.seconds_remaining is not None:
+            hrs, rem = divmod(b.seconds_remaining, 3600)
+            mins = rem // 60
+            tail = f"on battery · {hrs}h {mins}m left" if hrs else f"on battery · {mins}m left"
+        else:
+            tail = "on battery"
+        console.print(f"[bold]Battery[/]   {b.percent:.0f}%   {tail}")
     if sample.cassie.available:
         c = sample.cassie
         chunks = []
