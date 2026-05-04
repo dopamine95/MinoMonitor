@@ -97,6 +97,10 @@ class MinoMonitorApp(App):
         self._action_lock = asyncio.Lock()
         self._vibe_mode = vibe_mode
         self.sub_title = "vibe view" if vibe_mode else "live system telemetry"
+        # Pending outcome-check coroutines, kept alive so asyncio doesn't
+        # GC them mid-sleep. Each task removes itself from the set when
+        # it finishes (see _schedule_outcome_check).
+        self._outcome_tasks: set[asyncio.Task] = set()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -258,6 +262,11 @@ class MinoMonitorApp(App):
             await self._dispatch(action, pid, start_unix, group_name, **action_kwargs)
             return
 
+        # Capture the baseline BEFORE running the action so we can ask
+        # "did it help?" 60s later.
+        target_rss = self._target_rss_for_pids(targets)
+        baseline = self._capture_outcome_baseline(action, group_name, target_rss)
+
         ok_count = 0
         failures: list[str] = []
         for pid, start_unix in targets:
@@ -287,6 +296,106 @@ class MinoMonitorApp(App):
                 timeout=4,
             )
 
+        if baseline is not None and ok_count > 0:
+            self._schedule_outcome_check(baseline)
+
+    # ----- Outcome feedback -----
+    # After every successful action we schedule a check ~60s later that
+    # compares the system state to a baseline captured at action time and
+    # surfaces a "helped / neutral / worsened" verdict. Background tasks
+    # are kept in a set so they aren't garbage-collected mid-flight.
+
+    _OUTCOME_CHECK_SECONDS = 60
+
+    def _target_rss_for_pids(self, targets: list[tuple[int, int]]) -> float:
+        """Look up the combined footprint (in GB) of the given (pid, start)
+        tuples in the most recent sample. Used to grade `quit` actions —
+        if App Memory drops by close to this number, the quit "helped"."""
+        sample = self.sampler.latest
+        if sample is None:
+            return 0.0
+        target_set = {pid for pid, _ in targets}
+        total = 0.0
+        for row in sample.processes:
+            for pid, _ in row.child_pids:
+                if pid in target_set:
+                    total += row.rss_gb
+                    break
+        return round(total, 2)
+
+    def _capture_outcome_baseline(self, action: str, name: str, target_rss: float):
+        """Snapshot the current state for later comparison. Returns None
+        if there's no sample to compare to (very first tick) or if this
+        action is a no-op for outcome purposes (uncalm/thaw aren't worth
+        grading — the user just undid an earlier action)."""
+        if action in ("uncalm", "thaw"):
+            return None
+        sample = self.sampler.latest
+        if sample is None:
+            return None
+        from .actions.outcomes import OutcomeBaseline
+        return OutcomeBaseline(
+            action=action,
+            target_name=name,
+            target_rss_gb=target_rss,
+            memory=sample.memory,
+            cpu_total_pct=sample.cpu.total_pct,
+        )
+
+    def _schedule_outcome_check(self, baseline) -> None:
+        task = asyncio.create_task(self._outcome_check_task(baseline))
+        self._outcome_tasks.add(task)
+        task.add_done_callback(self._outcome_tasks.discard)
+
+    async def _outcome_check_task(self, baseline) -> None:
+        try:
+            await asyncio.sleep(self._OUTCOME_CHECK_SECONDS)
+            sample = self.sampler.latest
+            if sample is None:
+                return
+            from .actions.outcomes import evaluate
+            verdict = evaluate(baseline, sample.memory, sample.cpu.total_pct)
+            self._notify_outcome(baseline, verdict)
+            self._log_outcome(baseline, verdict)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Outcome feedback is non-critical; never raise into the loop.
+            pass
+
+    def _notify_outcome(self, baseline, verdict) -> None:
+        glyph, severity = {
+            "helped":   (theme.GLYPHS.icon_ok,       "information"),
+            "neutral":  (theme.GLYPHS.icon_info,     "information"),
+            "worsened": (theme.GLYPHS.icon_critical, "warning"),
+        }[verdict.bucket]
+        verb = {"calm": "Calmed", "freeze": "Paused", "quit": "Quit",
+                "calm_many": "Calmed"}.get(baseline.action, baseline.action)
+        self.notify(
+            f"{glyph} {verb} {baseline.target_name}: "
+            f"{verdict.bucket} — {verdict.summary}",
+            severity=severity,
+            timeout=8,
+        )
+
+    @staticmethod
+    def _log_outcome(baseline, verdict) -> None:
+        """Append a structured outcome line to ~/.minomonitor/actions.log
+        next to the action's own log line. Schema is plain, easy to grep
+        or feed to `minomon advise` later."""
+        try:
+            from .actions._common import append_action_log
+            append_action_log(
+                action=f"{baseline.action}.outcome",
+                pid=0,
+                start_unix=0,
+                success=(verdict.bucket != "worsened"),
+                message=f"{verdict.bucket}: {verdict.summary}",
+                name=baseline.target_name,
+            )
+        except Exception:
+            pass
+
     async def _run_action(self, action: str, pid: int, start_unix: int, **kwargs):
         """Single-pid action runner. Returns ActionResult or None for
         unknown actions. Used by _dispatch_many to keep each individual
@@ -311,6 +420,12 @@ class MinoMonitorApp(App):
         return None
 
     async def _dispatch(self, action: str, pid: int, start_unix: int, name: str, **kwargs) -> None:
+        # Snapshot baseline BEFORE the action so the outcome verdict has
+        # something honest to compare against.
+        baseline = self._capture_outcome_baseline(
+            action, name, target_rss=self._target_rss_for_pids([(pid, start_unix)])
+        )
+
         async with self._action_lock:
             try:
                 result = await self._run_action(action, pid, start_unix, **kwargs)
@@ -328,6 +443,9 @@ class MinoMonitorApp(App):
             severity=sev,
             timeout=4,
         )
+
+        if baseline is not None and result.success:
+            self._schedule_outcome_check(baseline)
 
     async def action_resume_all_paused(self) -> None:
         """Shift-R: resume every process this monitor currently has paused."""
