@@ -17,7 +17,7 @@ from typing import Awaitable, Callable, Optional
 import psutil
 
 from minomon.actions._common import MONITOR_PID_FILE, ensure_state_dirs, list_calmed_sentinels, list_paused_sentinels, prune_invalid_calmed_sentinels
-from minomon.actions.freeze import resume_orphaned_paused_processes
+from minomon.actions.freeze import read_pause_meta, resume_orphaned_paused_processes
 from .insights import build_insights
 from .macos import lsappinfo_front, memory_pressure, perf_levels, process_phys_footprint, running_apps, vm_stat
 from .pinned import AUDIO_BUNDLE_IDS, SOCKET_HEAVY_BUNDLE_IDS, add_terminal_app, is_pinned
@@ -257,6 +257,17 @@ class Sampler:
                 else:
                     state = _format_idle(seconds_idle)
 
+                pause_total: Optional[int] = None
+                pause_remain: Optional[int] = None
+                if state == "paused":
+                    meta_payload = read_pause_meta(pid, meta.start_unix)
+                    if meta_payload is not None:
+                        resume_at = meta_payload.get("resume_at")
+                        paused_at = meta_payload.get("paused_at")
+                        if resume_at and paused_at:
+                            pause_total = max(1, int(resume_at - paused_at))
+                            pause_remain = max(0, int(resume_at - now))
+
                 rows.append(
                     ProcessRow(
                         pid=pid,
@@ -271,6 +282,8 @@ class Sampler:
                         holds_socket=holds_socket,
                         seconds_idle=seconds_idle,
                         child_pids=[(pid, meta.start_unix)],
+                        pause_total_seconds=pause_total,
+                        pause_resume_in=pause_remain,
                     )
                 )
             except (psutil.Error, OSError):
@@ -462,6 +475,22 @@ def _group_rows(rows: list[ProcessRow]) -> list[ProcessRow]:
         # case), don't double-suffix — _group_key already keyed by name.
         display_name = f"{primary.name}{suffix}"
 
+        # If the most-alive member is paused, surface its countdown on the
+        # group row. Best-effort — picks the one with the longest remaining
+        # time so the user knows when the last helper auto-resumes.
+        paused_members = [m for m in members if m.state == "paused"]
+        if paused_members:
+            with_remain = [m for m in paused_members if m.pause_resume_in is not None]
+            anchor = (
+                max(with_remain, key=lambda m: m.pause_resume_in or 0)
+                if with_remain else paused_members[0]
+            )
+            pause_total = anchor.pause_total_seconds
+            pause_remain = anchor.pause_resume_in
+        else:
+            pause_total = None
+            pause_remain = None
+
         out.append(
             ProcessRow(
                 pid=primary.pid,
@@ -476,6 +505,8 @@ def _group_rows(rows: list[ProcessRow]) -> list[ProcessRow]:
                 holds_socket=any_socket,
                 seconds_idle=primary.seconds_idle,
                 child_pids=[(m.pid, m.start_unix) for m in members],
+                pause_total_seconds=pause_total,
+                pause_resume_in=pause_remain,
             )
         )
     return out

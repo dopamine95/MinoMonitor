@@ -65,6 +65,12 @@ class ProcessRow:
     # by actions to fan out (e.g. "Pause Brave" stops all helpers, not
     # just one). For ungrouped processes the list contains a single tuple.
     child_pids: list[tuple[int, int]] = field(default_factory=list)
+    # If state == "paused", these describe the auto-resume schedule.
+    # `pause_resume_in` is seconds remaining (0 if already past), or None
+    # if the user opted into an indefinite pause (no auto-resume scheduled).
+    # The UI uses this to render a "0:23 / 1:00" style countdown.
+    pause_total_seconds: Optional[int] = None
+    pause_resume_in: Optional[int] = None
 
 
 @dataclass

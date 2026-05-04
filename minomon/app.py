@@ -81,6 +81,7 @@ class MinoMonitorApp(App):
         Binding("?", "help", "Help"),
         Binding("q", "quit_app", "Quit"),
         Binding("r", "force_refresh", "Refresh"),
+        Binding("R", "resume_all_paused", "Resume all", show=True),
         Binding("v", "toggle_vibe", "Vibe view"),
         # Apply insight actions from anywhere in the UI. `a` runs the first
         # available action, the digits 1-9 target a specific one.
@@ -179,9 +180,15 @@ class MinoMonitorApp(App):
             await self._dispatch_many(message.action, targets, message.name)
             return
 
-        confirmed = await self.push_screen_wait(ConfirmAction(message.action, row))
-        if confirmed:
-            await self._dispatch_many(message.action, targets, message.name)
+        # Returns: None (cancelled), int seconds for freeze (0 = indefinite),
+        # or a sentinel non-zero int for other confirmed actions.
+        result = await self.push_screen_wait(ConfirmAction(message.action, row))
+        if result is None:
+            return
+        kwargs: dict = {}
+        if message.action == "freeze":
+            kwargs["auto_resume_seconds"] = None if result == 0 else result
+        await self._dispatch_many(message.action, targets, message.name, **kwargs)
 
     async def on_insight_action_requested(self, message: InsightActionRequested) -> None:
         payload = message.payload
@@ -242,12 +249,13 @@ class MinoMonitorApp(App):
         action: str,
         targets: list[tuple[int, int]],
         group_name: str,
+        **action_kwargs,
     ) -> None:
         """Run one action across N pids and post a single summary toast.
         For a group of one, behaves identically to the old per-pid dispatch."""
         if len(targets) == 1:
             pid, start_unix = targets[0]
-            await self._dispatch(action, pid, start_unix, group_name)
+            await self._dispatch(action, pid, start_unix, group_name, **action_kwargs)
             return
 
         ok_count = 0
@@ -255,7 +263,7 @@ class MinoMonitorApp(App):
         for pid, start_unix in targets:
             try:
                 async with self._action_lock:
-                    result = await self._run_action(action, pid, start_unix)
+                    result = await self._run_action(action, pid, start_unix, **action_kwargs)
                 if result is None or result.success:
                     ok_count += 1 if result is not None else 0
                 else:
@@ -279,11 +287,12 @@ class MinoMonitorApp(App):
                 timeout=4,
             )
 
-    async def _run_action(self, action: str, pid: int, start_unix: int):
+    async def _run_action(self, action: str, pid: int, start_unix: int, **kwargs):
         """Single-pid action runner. Returns ActionResult or None for
         unknown actions. Used by _dispatch_many to keep each individual
         call lock-free at the loop level (the caller holds the lock once
-        per pid)."""
+        per pid). `kwargs` are forwarded to the action — `freeze` accepts
+        `auto_resume_seconds` (int seconds, or None for indefinite)."""
         if action == "calm":
             from .actions.calm import calm
             return await calm(pid, start_unix)
@@ -292,7 +301,7 @@ class MinoMonitorApp(App):
             return await uncalm(pid, start_unix)
         if action == "freeze":
             from .actions.freeze import freeze
-            return await freeze(pid, start_unix)
+            return await freeze(pid, start_unix, **kwargs)
         if action == "thaw":
             from .actions.freeze import thaw
             return await thaw(pid, start_unix)
@@ -301,25 +310,11 @@ class MinoMonitorApp(App):
             return await quit_app(pid, start_unix)
         return None
 
-    async def _dispatch(self, action: str, pid: int, start_unix: int, name: str) -> None:
+    async def _dispatch(self, action: str, pid: int, start_unix: int, name: str, **kwargs) -> None:
         async with self._action_lock:
             try:
-                if action == "calm":
-                    from .actions.calm import calm
-                    result = await calm(pid, start_unix)
-                elif action == "uncalm":
-                    from .actions.calm import uncalm
-                    result = await uncalm(pid, start_unix)
-                elif action == "freeze":
-                    from .actions.freeze import freeze
-                    result = await freeze(pid, start_unix)
-                elif action == "thaw":
-                    from .actions.freeze import thaw
-                    result = await thaw(pid, start_unix)
-                elif action == "quit":
-                    from .actions.quit import quit_app
-                    result = await quit_app(pid, start_unix)
-                else:
+                result = await self._run_action(action, pid, start_unix, **kwargs)
+                if result is None:
                     self.notify(f"Unknown action: {action}", severity="error")
                     return
             except Exception as e:
@@ -333,6 +328,27 @@ class MinoMonitorApp(App):
             severity=sev,
             timeout=4,
         )
+
+    async def action_resume_all_paused(self) -> None:
+        """Shift-R: resume every process this monitor currently has paused."""
+        from .actions.freeze import thaw_all
+        async with self._action_lock:
+            resumed, failed = await thaw_all()
+        if resumed == 0 and failed == 0:
+            self.notify("Nothing was paused.", timeout=2)
+            return
+        if failed:
+            self.notify(
+                f"{theme.GLYPHS.icon_warn} Resumed {resumed} of {resumed + failed}.",
+                severity="warning",
+                timeout=4,
+            )
+        else:
+            self.notify(
+                f"{theme.GLYPHS.icon_ok} Resumed {resumed} paused process"
+                f"{'es' if resumed != 1 else ''}.",
+                timeout=3,
+            )
 
     def action_apply_first_insight(self) -> None:
         try:

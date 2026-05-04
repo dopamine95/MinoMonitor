@@ -1,13 +1,24 @@
 """
-3-second countdown confirm dialog. Shows the action, the target, the risks
-(audio/socket flags), and counts down before enabling Confirm.
+Confirm dialog with countdown.
+
+Returns:
+    None  — user cancelled
+    int   — user confirmed; for freeze actions this is the chosen
+            auto-resume duration in seconds, where 0 means indefinite
+            (no auto-resume scheduled). For other actions the value is
+            ignored.
+
+The freeze flow shows a duration picker row (30s · 1m · 2m · 5m · ∞)
+with the current choice highlighted and selectable via digit keys 1-5.
 """
 
 from __future__ import annotations
 
+from typing import Optional
+
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Center, Vertical
+from textual.containers import Center, Horizontal, Vertical
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
@@ -24,8 +35,8 @@ _ACTION_DESCRIPTION = {
     "freeze": ("Pause this app",
                "Pauses the app completely without quitting it. "
                "Memory stays where it is, but CPU work stops, which calms the system. "
-               "Auto-resumes in 60 seconds. Safe for most apps; "
-               "may briefly disconnect audio or live chat sessions on resume."),
+               "Safe for most apps; may briefly disconnect audio or live "
+               "chat sessions when resumed."),
     "thaw":   ("Resume this app",
                "Wakes a paused app right back up where it left off."),
     "quit":   ("Quit application",
@@ -33,15 +44,33 @@ _ACTION_DESCRIPTION = {
 }
 
 
-class ConfirmAction(ModalScreen[bool]):
-    """Returns True if confirmed, False if cancelled."""
+# Duration choices for the freeze picker. (label, seconds). 0 = indefinite.
+_DURATION_OPTIONS = (
+    ("30s", 30),
+    ("1m",  60),
+    ("2m",  120),
+    ("5m",  300),
+    ("∞",   0),
+)
+_DEFAULT_DURATION_INDEX = 1  # 1m — same as the previous hardcoded behavior
+
+
+class ConfirmAction(ModalScreen[Optional[int]]):
+    """Modal confirm with optional duration picker for freeze actions."""
 
     BINDINGS = [
-        Binding("escape", "dismiss(False)", "Cancel"),
+        Binding("escape", "cancel", "Cancel"),
         Binding("enter", "confirm", "Confirm"),
+        # Digit keys 1-5 pick a freeze duration. Harmless on other actions.
+        Binding("1", "pick_duration(0)", show=False),
+        Binding("2", "pick_duration(1)", show=False),
+        Binding("3", "pick_duration(2)", show=False),
+        Binding("4", "pick_duration(3)", show=False),
+        Binding("5", "pick_duration(4)", show=False),
     ]
 
     countdown: reactive[int] = reactive(3)
+    duration_index: reactive[int] = reactive(_DEFAULT_DURATION_INDEX)
 
     def __init__(self, action: str, row: ProcessRow):
         super().__init__()
@@ -54,11 +83,9 @@ class ConfirmAction(ModalScreen[bool]):
         warnings = []
         if self.action == "freeze":
             if self.row.holds_audio:
-                warnings.append("This app holds an audio session — playback may need reinit on thaw.")
+                warnings.append("This app holds an audio session — playback may need reinit on resume.")
             if self.row.holds_socket:
                 warnings.append("This app holds a live WebSocket — server may time out at ~60s.")
-        # If the row groups several helpers, the action will fan out — make
-        # that explicit so the user knows what they're agreeing to.
         n = len(self.row.child_pids)
         if n > 1 and self.action in ("freeze", "calm"):
             warnings.append(
@@ -75,23 +102,42 @@ class ConfirmAction(ModalScreen[bool]):
             )
         )
 
-        body = Vertical(
+        children: list = [
             Static(f"[bold {theme.PALETTE['primary']}]{title}[/]"),
             Static(""),
             Static(target_line),
             Static(f"[{theme.PALETTE['fg']}]{desc}[/]"),
             Static(""),
-            *[Static(f"[{theme.SEVERITY['warn']}]{theme.GLYPHS.icon_warn} {w}[/]") for w in warnings],
-            Static(""),
-            Static(self._countdown_markup(), id="countdown"),
-            Static(""),
+        ]
+
+        if self.action == "freeze":
+            children.append(
+                Static(
+                    f"[{theme.PALETTE['muted']}]Auto-resume after  "
+                    f"[/]{self._duration_picker_markup()}",
+                    id="duration-picker",
+                )
+            )
+            children.append(Static(""))
+
+        for w in warnings:
+            children.append(
+                Static(f"[{theme.SEVERITY['warn']}]{theme.GLYPHS.icon_warn} {w}[/]")
+            )
+        if warnings:
+            children.append(Static(""))
+
+        children.append(Static(self._countdown_markup(), id="countdown"))
+        children.append(Static(""))
+        children.append(
             Center(
                 Button("Cancel", id="cancel", variant="default"),
                 Button("Confirm", id="confirm", variant="error", disabled=True),
-            ),
-            id="confirm-body",
+            )
         )
-        body.styles.width = 64
+
+        body = Vertical(*children, id="confirm-body")
+        body.styles.width = 70
         body.styles.padding = (1, 2)
         body.styles.background = theme.PALETTE["bg_panel"]
         body.styles.border = ("heavy", theme.PALETTE["border"])
@@ -99,6 +145,24 @@ class ConfirmAction(ModalScreen[bool]):
 
     def on_mount(self) -> None:
         self._timer = self.set_interval(1.0, self._tick)
+
+    def _duration_picker_markup(self) -> str:
+        chips = []
+        for i, (label, _seconds) in enumerate(_DURATION_OPTIONS):
+            digit = i + 1
+            if i == self.duration_index:
+                chips.append(
+                    f"[bold {theme.PALETTE['bg']} on {theme.PALETTE['primary']}]"
+                    f" {digit} {label} [/]"
+                )
+            else:
+                chips.append(
+                    f"[{theme.PALETTE['muted']}] {digit} {label} [/]"
+                )
+        hint = (
+            f"  [{theme.PALETTE['dim']}](press 1-5 to pick)[/]"
+        )
+        return "  ".join(chips) + hint
 
     def _countdown_markup(self) -> str:
         if self.countdown > 0:
@@ -111,6 +175,15 @@ class ConfirmAction(ModalScreen[bool]):
     def watch_countdown(self, _old: int, _new: int) -> None:
         try:
             self.query_one("#countdown", Static).update(self._countdown_markup())
+        except Exception:
+            pass
+
+    def watch_duration_index(self, _old: int, _new: int) -> None:
+        try:
+            self.query_one("#duration-picker", Static).update(
+                f"[{theme.PALETTE['muted']}]Auto-resume after  [/]"
+                + self._duration_picker_markup()
+            )
         except Exception:
             pass
 
@@ -128,14 +201,32 @@ class ConfirmAction(ModalScreen[bool]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "confirm" and not event.button.disabled:
-            self.dismiss(True)
+            self.dismiss(self._chosen_seconds())
         elif event.button.id == "cancel":
-            self.dismiss(False)
+            self.dismiss(None)
 
     def action_confirm(self) -> None:
         try:
             btn = self.query_one("#confirm", Button)
             if not btn.disabled:
-                self.dismiss(True)
+                self.dismiss(self._chosen_seconds())
         except Exception:
             pass
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_pick_duration(self, idx: int) -> None:
+        if self.action != "freeze":
+            return
+        idx = int(idx)
+        if 0 <= idx < len(_DURATION_OPTIONS):
+            self.duration_index = idx
+
+    def _chosen_seconds(self) -> int:
+        """Returns the chosen duration in seconds for freeze, or a sentinel
+        non-zero int for other actions (the value is ignored by callers
+        on non-freeze actions)."""
+        if self.action != "freeze":
+            return 1
+        return _DURATION_OPTIONS[self.duration_index][1]

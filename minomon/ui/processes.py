@@ -51,12 +51,30 @@ def _process_count_estimate() -> int:
     return _PROC_COUNT_CACHE["value"]
 
 
+def _fmt_mmss(seconds: int) -> str:
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _pause_countdown(row: ProcessRow) -> str:
+    """' 0:23/1:00' for a timed pause, ' (∞)' for indefinite, '' if no meta."""
+    if row.pause_resume_in is None and row.pause_total_seconds is None:
+        return ""
+    if row.pause_total_seconds is None or row.pause_resume_in is None:
+        return " (∞)"
+    return f" {_fmt_mmss(row.pause_resume_in)}/{_fmt_mmss(row.pause_total_seconds)}"
+
+
 def _state_label_vibe(row: ProcessRow) -> str:
     """Plain-English version of the technical state."""
     s = row.state
     if row.pinned:
         return "system · protected"
     if s == "paused":
+        countdown = _pause_countdown(row)
+        if countdown == " (∞)":
+            return "paused by you · indefinite"
+        if countdown:
+            return f"paused · resumes in{countdown.split('/')[0]}"
         return "paused by you"
     if s == "calmed":
         return "running quietly (you slowed it)"
@@ -294,7 +312,7 @@ class ProcessesPanel(Vertical):
         if self.vibe_mode:
             state_text = _state_label_vibe(row)
         else:
-            state_text = row.state
+            state_text = row.state + _pause_countdown(row)
         state = Text(state_text, style=_state_color(row.state, row.pinned))
 
         action = _action_cell(row, vibe=self.vibe_mode)
