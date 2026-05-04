@@ -82,6 +82,10 @@ class MinoMonitorApp(App):
         Binding("q", "quit_app", "Quit"),
         Binding("r", "force_refresh", "Refresh"),
         Binding("v", "toggle_vibe", "Vibe view"),
+        # Apply insight actions from anywhere in the UI. `a` runs the first
+        # available action, the digits 1-9 target a specific one.
+        Binding("a", "apply_first_insight", "Apply", show=True),
+        *[Binding(str(d), f"apply_insight({d})", show=False) for d in range(1, 10)],
     ]
 
     TITLE = "Mino Monitor"
@@ -169,10 +173,54 @@ class MinoMonitorApp(App):
     async def on_insight_action_requested(self, message: InsightActionRequested) -> None:
         payload = message.payload
         action = payload.get("action")
+        if not action:
+            return
+
+        # Bulk action: insights can suggest "calm Slack + Discord + Notion" as
+        # a single bundle. Iterate the target list and fire each individually.
+        if action == "calm_many":
+            targets = payload.get("targets") or []
+            if not targets:
+                return
+            ok_count = 0
+            failures: list[str] = []
+            for t in targets:
+                pid = int(t.get("pid", 0))
+                start_unix = int(t.get("start_unix", 0))
+                name = t.get("name", f"pid {pid}")
+                if not pid:
+                    continue
+                try:
+                    from .actions.calm import calm
+                    async with self._action_lock:
+                        result = await calm(pid, start_unix)
+                    if result.success:
+                        ok_count += 1
+                    else:
+                        failures.append(f"{name}: {result.message}")
+                except Exception as e:
+                    failures.append(f"{name}: {e}")
+            total = len(targets)
+            if failures:
+                self.notify(
+                    f"{theme.GLYPHS.icon_warn} Calmed {ok_count} of {total}. "
+                    f"Failures: {'; '.join(failures[:3])}",
+                    severity="warning",
+                    timeout=6,
+                )
+            else:
+                self.notify(
+                    f"{theme.GLYPHS.icon_ok} Calmed {ok_count} processes.",
+                    severity="information",
+                    timeout=4,
+                )
+            return
+
+        # Single-target action: same shape as table-row actions.
         pid = int(payload.get("pid", 0))
         start_unix = int(payload.get("start_unix", 0))
         name = payload.get("name", f"pid {pid}")
-        if not action or not pid:
+        if not pid:
             return
         await self._dispatch(action, pid, start_unix, name)
 
@@ -208,6 +256,28 @@ class MinoMonitorApp(App):
             severity=sev,
             timeout=4,
         )
+
+    def action_apply_first_insight(self) -> None:
+        try:
+            panel = self.query_one("#insights", InsightsPanel)
+        except Exception:
+            return
+        if not panel.numbered_actions:
+            self.notify("No insight has an action available right now.", timeout=2)
+            return
+        _label, payload = panel.numbered_actions[0]
+        self.post_message(InsightActionRequested(payload))
+
+    def action_apply_insight(self, index: int) -> None:
+        try:
+            panel = self.query_one("#insights", InsightsPanel)
+        except Exception:
+            return
+        idx = int(index) - 1
+        if idx < 0 or idx >= len(panel.numbered_actions):
+            return
+        _label, payload = panel.numbered_actions[idx]
+        self.post_message(InsightActionRequested(payload))
 
     async def action_quit_app(self) -> None:
         self.exit()
