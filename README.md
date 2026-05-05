@@ -120,6 +120,56 @@ cp contrib/com.minomon-watchdog.plist.template ~/Library/LaunchAgents/com.minomo
 launchctl load ~/Library/LaunchAgents/com.minomon-watchdog.plist
 ```
 
+## Optional: rule advisor (Claude Code)
+
+`minomon --advise` invokes [Claude Code](https://docs.claude.com/en/docs/claude-code/quickstart)
+in headless mode (`claude -p ...`) with a snapshot of your actions log,
+config, and current system state, and asks for one or two concrete
+rule-change proposals based on what's actually happened on your Mac.
+
+Off by default. To enable, add to `~/.minomonitor/config.toml`:
+
+```toml
+[advisor]
+engine = "claude-code"
+timeout_seconds = 120
+```
+
+Claude's response saves to `~/.minomonitor/advice/<timestamp>.md` and
+**never auto-applies any change** — you read it, you edit the config
+yourself if you want to act on it.
+
+What gets sent to Claude on each invocation:
+- Last 200 lines of `~/.minomonitor/actions.log`
+- Your `~/.minomonitor/config.toml`
+- Top 10 processes by `phys_footprint` and current memory pressure
+
+Run with `claude` not on PATH and you'll get a precise error. Same with
+`engine = "none"` (the default).
+
+## Optional: conservative auto-mode
+
+A single, deliberately narrow rule for the impatient: when memory
+pressure is **CRITICAL** and an app has been idle for at least an hour
+and isn't holding audio or live sockets, automatically `calm` it
+(taskpolicy -b — gentle, reversible, no socket damage). Capped at two
+fires per hour with a 30-minute per-PID cooldown. Never freezes,
+never quits.
+
+Off by default. To enable:
+
+```toml
+[automode]
+enabled = true
+max_per_hour = 2
+idle_minimum_seconds = 3600
+```
+
+When on, the meters panel shows a small `auto-mode on · 0/2 fires in
+last hour` badge. Every auto-action lands in `actions.log` with action
+`auto.calm`, and the same outcome-feedback toast fires 60s later so
+you can see whether the auto-call actually helped.
+
 ## Optional: link a local helper app
 
 The header has room for a one-line "linked app" status — for example, an

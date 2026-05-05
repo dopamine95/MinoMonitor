@@ -35,6 +35,52 @@ def load_user_config() -> dict[str, list[str]]:
     return {"pin": pin, "unpin": unpin}
 
 
+def load_automode_config() -> dict:
+    """Reads the [automode] section. Default-disabled. Returns:
+
+        {
+            "enabled":        bool,
+            "max_per_hour":   int,
+            "idle_minimum":   int,    # seconds
+        }
+
+    Auto-mode only ever fires `calm` (taskpolicy -b), never SIGSTOP or
+    quit. The cap fields below are upper bounds — a sensible user could
+    tighten them but not loosen them past the safety ceilings.
+    """
+    defaults = {
+        "enabled": False,
+        "max_per_hour": 2,        # ceiling: 6
+        "idle_minimum": 60 * 60,  # seconds — 1 hour minimum
+    }
+    if not CONFIG_PATH.exists():
+        return defaults
+    try:
+        with CONFIG_PATH.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return defaults
+    am = data.get("automode")
+    if not isinstance(am, dict):
+        return defaults
+    enabled = bool(am.get("enabled", False))
+    try:
+        max_per_hour = int(am.get("max_per_hour", 2))
+        max_per_hour = max(1, min(6, max_per_hour))   # safety ceiling
+    except (TypeError, ValueError):
+        max_per_hour = 2
+    try:
+        idle_minimum = int(am.get("idle_minimum_seconds", 60 * 60))
+        idle_minimum = max(15 * 60, min(6 * 3600, idle_minimum))  # 15m..6h
+    except (TypeError, ValueError):
+        idle_minimum = 60 * 60
+    return {
+        "enabled": enabled,
+        "max_per_hour": max_per_hour,
+        "idle_minimum": idle_minimum,
+    }
+
+
 def load_advisor_config() -> dict:
     """Reads the [advisor] section. Default-disabled — `minomon advise`
     is a no-op until the user explicitly opts in. Returns:

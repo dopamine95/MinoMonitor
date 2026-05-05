@@ -24,6 +24,7 @@ class MetersPanel(Static):
 
     sample: reactive[Sample | None] = reactive(None)
     vibe_mode: reactive[bool] = reactive(False)
+    automode_status: reactive[str | None] = reactive(None)
 
     def __init__(self, history_seconds: int = 60, **kwargs):
         super().__init__(**kwargs)
@@ -258,10 +259,13 @@ class MetersPanel(Static):
             right.add_row("", cassie_line)
 
         body.add_row(left, right)
+        title = "live system"
+        if self.automode_status:
+            title = f"live system  ·  [bold {theme.SEVERITY['warn']}]{self.automode_status}[/]"
         return Panel(
             body,
             border_style=theme.PALETTE["border"],
             padding=(0, 1),
-            title=f"[bold {theme.PALETTE['primary']}]live system[/]",
+            title=f"[bold {theme.PALETTE['primary']}]{title}[/]",
             title_align="left",
         )

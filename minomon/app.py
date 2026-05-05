@@ -101,6 +101,11 @@ class MinoMonitorApp(App):
         # GC them mid-sleep. Each task removes itself from the set when
         # it finishes (see _schedule_outcome_check).
         self._outcome_tasks: set[asyncio.Task] = set()
+        # Conservative auto-mode (off unless user opted in via config).
+        # Consulted on every sample; runs the rule check inline.
+        from .automode import AutoMode
+        self.automode = AutoMode(self)
+        self._automode_tasks: set[asyncio.Task] = set()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -149,12 +154,22 @@ class MinoMonitorApp(App):
         # The sampler may call us from any task; use call_from_thread when
         # invoked off the event loop. In practice it's always on the same loop.
         try:
-            self.query_one("#meters", MetersPanel).push(sample)
+            meters = self.query_one("#meters", MetersPanel)
+            meters.push(sample)
+            meters.automode_status = self.automode.status_line()
             self.query_one("#processes", ProcessesPanel).push(sample)
             self.query_one("#insights", InsightsPanel).push(sample)
         except Exception:
             # During teardown the queries may fail — silently ignore.
             pass
+
+        # Let auto-mode look at this sample. It runs async (calm is async)
+        # but we don't await it — it lives in its own task so the sampler
+        # callback stays cheap. Auto-mode is no-op unless the user opted in.
+        if self.automode.enabled:
+            task = asyncio.create_task(self.automode.consider(sample))
+            self._automode_tasks.add(task)
+            task.add_done_callback(self._automode_tasks.discard)
 
     async def on_action_requested(self, message: ActionRequested) -> None:
         """Routed from the process table. Fans out across all child pids
