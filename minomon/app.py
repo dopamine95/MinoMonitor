@@ -9,6 +9,7 @@ import asyncio
 import os
 from pathlib import Path
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -172,10 +173,18 @@ class MinoMonitorApp(App):
             task.add_done_callback(self._automode_tasks.discard)
 
     async def on_action_requested(self, message: ActionRequested) -> None:
-        """Routed from the process table. Fans out across all child pids
-        when the row represents a group (Brave + 8 helpers, Xcode + 4
-        XPC services, etc.) so the action covers the whole app, not just
-        the parent."""
+        """Routed from the process table. Delegates to a worker so the
+        modal-dialog dismissal path (push_screen_wait) has the worker
+        context Textual now requires for that API. Without the worker
+        wrapping, every freeze/quit raised NoActiveWorker on confirm."""
+        self._handle_action_in_worker(message)
+
+    @work(exclusive=False)
+    async def _handle_action_in_worker(self, message: ActionRequested) -> None:
+        """Worker that owns the dialog → action flow. Fans out across
+        all child pids when the row represents a group (Brave + 8
+        helpers, Xcode + 4 XPC services, etc.) so the action covers
+        the whole app, not just the parent."""
         sample = self.sampler.latest
         if sample is None:
             return
